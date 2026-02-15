@@ -1,0 +1,56 @@
+# Firebase credentials (NEVER commit)
+**/birdfeeder-sa.json
+*.json.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+pi/.venv/
+pi/venv/
+
+# Logs and data files (generated on the Pi)
+pi/Logs/
+pi/*.csv
+pi/*.log
+pi/log_data.log
+pi/local_app_settings.json
+
+# Flutter/Dart build artifacts
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/.pub-cache/
+app/.pub/
+app/build/
+app/coverage/
+
+# Flutter generated files
+app/**/doc/api/
+app/**/ios/Flutter/.last_build_id
+app/app.*.symbols
+app/app.*.map.json
+
+# Android build artifacts
+app/android/app/debug
+app/android/app/profile
+app/android/app/release
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Temporary files
+*.tmp
+*.temp
