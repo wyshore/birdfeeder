@@ -3,6 +3,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import '../models/sighting.dart';
+import '../config/firebase_paths.dart';
 import 'catalog_screen.dart'; 
 
 // --- Helper Extensions for Name Standardization (Kept) ---
@@ -139,7 +140,7 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
   // --- Firebase Access Helpers ---
 
   String _getSightingCollectionPath(String collectionId) {
-    return 'logs/$collectionId/data';
+    return LogPaths.getLogPath(collectionId);
   }
 
   // Uses the public static constant

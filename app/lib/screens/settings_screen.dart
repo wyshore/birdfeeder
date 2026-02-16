@@ -1,9 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import '../models/camera_settings.dart'; 
-
-/// The Firestore path to the camera configuration document.
-const String _configDocPath = 'config/settings';
+import '../models/camera_settings.dart';
+import '../config/firebase_paths.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -14,8 +12,8 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   // 1. Get a reference to the Firestore document
-  final DocumentReference _settingsRef = 
-      FirebaseFirestore.instance.doc(_configDocPath);
+  final DocumentReference _settingsRef =
+      FirebaseFirestore.instance.doc(ConfigPaths.settings);
 
   // Local state to hold current values, which are updated when Firestore data arrives
   CameraSettings? _localSettings;

@@ -1,11 +1,11 @@
 // lib/screens/home_screen.dart
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart'; //for checking heartbeat status
-import 'gallery_screen.dart'; // Import the gallery screen
-import 'catalog_screen.dart'; // Import the catalog screen
-import 'live_feed_screen.dart'; // Import the live feed screen
-import 'system_screen.dart'; // Import the system hub screen
-import '../globals.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import '../config/firebase_paths.dart';
+import 'gallery_screen.dart';
+import 'catalog_screen.dart';
+import 'live_feed_screen.dart';
+import 'system_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -50,20 +50,14 @@ class _HomeScreenState extends State<HomeScreen> {
 
             // 2. Online/Offline Status Dot
             StreamBuilder<DocumentSnapshot>(
-              stream: FirebaseFirestore.instance
-                  .collection('status')
-                  .doc('heartbeat')
-                  .snapshots(),
+              stream: FirebaseFirestore.instance.doc(StatusPaths.heartbeat).snapshots(),
               builder: (context, snapshot) {
                 bool isOnline = false;
                 if (snapshot.hasData && snapshot.data!.exists) {
                   final data = snapshot.data!.data() as Map<String, dynamic>;
-                  
-                  if (data.containsKey('ip_address')) {
-                  currentPiIp = data['ip_address'];
-                  }
+                  final status = data['status'] as String?;
                   final Timestamp? lastSeen = data['last_seen'];
-                  if (lastSeen != null) {
+                  if (lastSeen != null && status == 'online') {
                     isOnline = DateTime.now().difference(lastSeen.toDate()).inSeconds < 60;
                   }
                 }

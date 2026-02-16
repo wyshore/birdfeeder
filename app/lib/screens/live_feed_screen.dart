@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'dart:io'; 
-import 'dart:typed_data'; 
-import 'dart:async'; 
+import 'dart:io';
+import 'dart:typed_data';
+import 'dart:async';
 import 'dart:math';
-import '../globals.dart';
+import '../config/firebase_paths.dart';
+import '../services/pi_connection_service.dart';
 
 /// This screen manages the live stream through:
 /// 1. Toggling the stream state via Firestore ('status/streaming_enabled').
@@ -20,8 +21,6 @@ class LiveFeedScreen extends StatefulWidget {
 class _LiveFeedScreenState extends State<LiveFeedScreen> {
   // --- Configuration Constants ---
   static const int streamPort = 8000;
-  static const String CONFIG_PATH = 'config/settings';
-  static const String STREAMING_STATUS_PATH = 'status/streaming_enabled';
   
   // --- TCP Command Definitions ---
   // Matches Python server's CMD_PREFIX (0x01) and CMD_SNAPSHOT (0x01)
@@ -73,7 +72,7 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
 
   void _startFirebaseListeners() {
     // 1. Listen for the streaming status toggle
-    final streamingStatusDoc = FirebaseFirestore.instance.doc(STREAMING_STATUS_PATH);
+    final streamingStatusDoc = FirebaseFirestore.instance.doc(StatusPaths.streamingEnabled);
     _statusSubscription = streamingStatusDoc.snapshots().listen((snapshot) {
       if (snapshot.exists && snapshot.data() != null) {
         final data = snapshot.data()!;
@@ -111,7 +110,7 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
 
 
     // 2. Listen for configuration updates to show metadata
-    final configDoc = FirebaseFirestore.instance.doc(CONFIG_PATH);
+    final configDoc = FirebaseFirestore.instance.doc(ConfigPaths.settings);
     _configSubscription = configDoc.snapshots().listen((snapshot) {
       if (snapshot.exists && snapshot.data() != null) {
         final data = snapshot.data()!;
@@ -132,7 +131,7 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
     });
 
     try {
-      await FirebaseFirestore.instance.doc(STREAMING_STATUS_PATH).set(
+      await FirebaseFirestore.instance.doc(StatusPaths.streamingEnabled).set(
         {
           'enabled': newStatus,
           'timestamp': FieldValue.serverTimestamp(),
@@ -175,7 +174,7 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
   while (mounted && _isStreamingEnabled) {
     try {
       _socket = await Socket.connect(
-        currentPiIp, 
+        PiConnectionService().ipAddress, 
         streamPort,
         timeout: const Duration(seconds: 5)
         );
@@ -220,7 +219,7 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
         _disconnectSocket();
         _stopBorderPulse(); 
         _showSimpleMessage(context, 'Error',
-            'Failed to connect to $currentPiIp:$streamPort after waiting ${elapsed.inSeconds}s.');
+            'Failed to connect to $PiConnectionService().ipAddress:$streamPort after waiting ${elapsed.inSeconds}s.');
         return;
       }
     }
