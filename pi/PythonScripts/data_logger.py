@@ -1,173 +1,162 @@
 # -*- coding: utf-8 -*-
 """
-ENERGY DATA LOGGER (Step 2.2 - Low-Cost Local Logging)
+ENERGY DATA LOGGER
 
-This script reads voltage data and APPENDS it to a local CSV file.
-It AVOIDS importing the heavy Firebase SDK to prevent memory spikes.
-Data must be uploaded later by a separate 'dumper' script.
+Reads voltage data from ADS1115 ADC and appends to local CSV file.
+Avoids importing Firebase SDK to minimize memory usage.
+Designed to run frequently via cron (e.g., every minute).
+
+Data is uploaded later by data_uploader.py when app is open.
 """
 
 import os
 import sys
-from datetime import datetime
-import board
-import busio
+import csv
 import time
 import traceback
-import csv
+from datetime import datetime
 
-# ADS1115 Library Imports
+# Import shared configuration
+import shared_config as config
+
+# ADS1115 library imports
 try:
-    # 1. Import the specific ADS1115 chip class directly
-    from adafruit_ads1x15.ads1115 import ADS1115 
-    # 2. Import the AnalogIn class
+    import board
+    import busio
+    from adafruit_ads1x15.ads1115 import ADS1115
     from adafruit_ads1x15.analog_in import AnalogIn
-    
-    # Hardcoded pin indices
-    P0_INDEX = 0
-    P1_INDEX = 1
-
-except ImportError:
-    print("FATAL ERROR: ADS1115 libraries not found.")
+except ImportError as e:
+    print(f"FATAL: ADS1115 libraries not found: {e}")
+    print("Install with: pip install adafruit-ads1x15")
     sys.exit(1)
 
 
-# --- CONFIGURATION ---
-
-# Local file path for storing collected data
-LOCAL_LOG_FILE = "/home/wyattshore/Birdfeeder/Logs/energy_log.csv"
-
-# ADS1115 Hardware Configuration
-I2C_ADDRESS = 0x48 
-ADS_GAIN_MULTIPLIER = 0.6666666666666666 
-
-# Voltage Divider Ratios 
-VOLTAGE_DIVIDER_RATIO_A0 = 2.419 # Solar Panel Voltage Multiplier
-VOLTAGE_DIVIDER_RATIO_A1 = 1.435 # Battery Voltage Multiplier
-
-# Battery Management Configuration 
-BATTERY_MAX_VOLTAGE = 4.2 
-BATTERY_MIN_VOLTAGE = 3.2 
-
-
-# --- Helper Functions (Firebase related functions removed) ---
-
 def init_ads1115():
-    """Initializes the ADS1115 I2C connection and returns the channels."""
+    """
+    Initialize ADS1115 I2C connection.
+
+    Returns:
+        tuple: (solar_channel, battery_channel, i2c_bus) or (None, None, None) on failure
+    """
     try:
-        # 1. Initialize the I2C bus
+        # Initialize I2C bus
         i2c = busio.I2C(board.SCL, board.SDA)
 
-        # 2. Create the ADS1115 object
-        ads_device = ADS1115(i2c, address=I2C_ADDRESS)
+        # Create ADS1115 device
+        ads = ADS1115(i2c, address=config.ADC_ADDRESS)
+        ads.gain = config.ADC_GAIN
 
-        # 3. Configure the gain/FSR for the ADS
-        ads_device.gain = ADS_GAIN_MULTIPLIER
+        # Create analog input channels
+        solar_ch = AnalogIn(ads, config.SOLAR_VOLTAGE_CHANNEL)
+        battery_ch = AnalogIn(ads, config.BATTERY_VOLTAGE_CHANNEL)
 
-        # 4. Create analog input channel objects
-        channel_solar = AnalogIn(ads_device, P0_INDEX) 
-        channel_battery = AnalogIn(ads_device, P1_INDEX) 
-
-        # WARM-UP: discard the first conversion(s)
+        # Warm-up: discard first conversions
         try:
-            _ = channel_solar.value
-            _ = channel_battery.value
+            _ = solar_ch.value
+            _ = battery_ch.value
             time.sleep(0.05)
-            _ = channel_solar.voltage
-            _ = channel_battery.voltage
+            _ = solar_ch.voltage
+            _ = battery_ch.voltage
             time.sleep(0.05)
         except Exception:
             pass
-        
-        # print(">> ADS1115 I2C initialized.") # Keeping print statements minimal
-        return channel_solar, channel_battery, i2c
+
+        return solar_ch, battery_ch, i2c
 
     except Exception as e:
-        print(f"ERROR: Failed to initialize ADS1115: {e}")
+        print(f"ERROR: ADS1115 initialization failed: {e}")
+        traceback.print_exc()
         return None, None, None
 
+
 def calculate_battery_percentage(voltage):
-    """Calculates battery percentage based on min/max voltage limits."""
-    if voltage >= BATTERY_MAX_VOLTAGE:
+    """
+    Calculate battery percentage from voltage.
+
+    Args:
+        voltage: Battery voltage (V)
+
+    Returns:
+        float: Battery percentage (0-100)
+    """
+    if voltage >= config.BATTERY_MAX_VOLTAGE:
         return 100
-    if voltage <= BATTERY_MIN_VOLTAGE:
+    if voltage <= config.BATTERY_MIN_VOLTAGE:
         return 0
-    
-    range_v = BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE
-    percent = ((voltage - BATTERY_MIN_VOLTAGE) / range_v) * 100
-    return round(max(0, min(100, percent)), 1) 
-        
-# --- Main Execution ---
+
+    voltage_range = config.BATTERY_MAX_VOLTAGE - config.BATTERY_MIN_VOLTAGE
+    percent = ((voltage - config.BATTERY_MIN_VOLTAGE) / voltage_range) * 100
+    return round(max(0, min(100, percent)), 1)
+
 
 if __name__ == "__main__":
-    
-    i2c_bus = None 
+    i2c_bus = None
 
     try:
-        # 1. Initialize Hardware
-        channel_solar, channel_battery, i2c_bus = init_ads1115()
-        if channel_solar is None or channel_battery is None:
+        # Initialize hardware
+        solar_ch, battery_ch, i2c_bus = init_ads1115()
+        if solar_ch is None or battery_ch is None:
+            print("ERROR: Failed to initialize ADS1115")
             sys.exit(1)
-            
-        # 2. Read Sensor Data
+
+        # Read sensor data
         try:
-            # Read Solar Data (A0)
-            solar_adc_voltage = channel_solar.voltage 
-            solar_voltage_actual = solar_adc_voltage * VOLTAGE_DIVIDER_RATIO_A0 
-            
-            # Read Battery Data (A1)
-            battery_adc_voltage = channel_battery.voltage
-            battery_voltage_actual = battery_adc_voltage * VOLTAGE_DIVIDER_RATIO_A1
-            
-            # Calculate Percentage
-            battery_percent = calculate_battery_percentage(battery_voltage_actual)
-            
+            # Solar voltage (A0)
+            solar_adc_voltage = solar_ch.voltage
+            solar_voltage = solar_adc_voltage * config.SOLAR_VOLTAGE_DIVIDER
+
+            # Battery voltage (A1)
+            battery_adc_voltage = battery_ch.voltage
+            battery_voltage = battery_adc_voltage * config.BATTERY_VOLTAGE_DIVIDER
+
+            # Battery percentage
+            battery_percent = calculate_battery_percentage(battery_voltage)
+
         except Exception as e:
-            print(f"FATAL ERROR during sensor read: {e}")
-            traceback.print_exc(file=sys.stdout)
+            print(f"ERROR: Sensor read failed: {e}")
+            traceback.print_exc()
             sys.exit(1)
-            
-        # 3. Prepare Data Row
-        # --- ADJUSTMENT HERE: Format timestamp to second precision ---
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # We only log the three values you need: timestamp, solar V, battery V
+
+        # Prepare data row
+        timestamp = config.get_timestamp_string()
         data_row = [
             timestamp,
-            round(solar_voltage_actual, 3),
-            round(battery_voltage_actual, 3),
+            round(solar_voltage, 3),
+            round(battery_voltage, 3),
             battery_percent
         ]
 
-        # 4. Log Data to Local CSV File (APPEND mode)
-        is_new_file = not os.path.exists(LOCAL_LOG_FILE) or os.stat(LOCAL_LOG_FILE).st_size == 0
-        
+        # Append to CSV file
+        is_new_file = (
+            not os.path.exists(config.ENERGY_LOG_FILE) or
+            os.stat(config.ENERGY_LOG_FILE).st_size == 0
+        )
+
         try:
-            with open(LOCAL_LOG_FILE, 'a', newline='') as f:
+            with open(config.ENERGY_LOG_FILE, 'a', newline='') as f:
                 writer = csv.writer(f)
-                
-                # Write header only if the file is new or empty
+
+                # Write header if new file
                 if is_new_file:
                     writer.writerow(['timestamp', 'solar_voltage', 'battery_voltage', 'battery_percent'])
-                    
+
                 writer.writerow(data_row)
-            
-            print(f"Logged {len(data_row)-1} values to local buffer: {LOCAL_LOG_FILE}")
-            print(f"Battery V: {data_row[2]}V ({data_row[3]}%) | Solar V: {data_row[1]}V")
+
+            print(f"Logged to {config.ENERGY_LOG_FILE}")
+            print(f"Battery: {data_row[2]}V ({data_row[3]}%) | Solar: {data_row[1]}V")
 
         except Exception as e:
-            print(f"FATAL ERROR: Failed to write data to local CSV: {e}")
-            traceback.print_exc(file=sys.stdout)
+            print(f"ERROR: Failed to write CSV: {e}")
+            traceback.print_exc()
             sys.exit(1)
-            
+
     finally:
-        # Memory Cleanup
+        # Cleanup I2C bus
         if i2c_bus is not None:
             try:
-                # The busio object might not have a deinit, but we try anyway
-                i2c_bus.deinit() 
+                i2c_bus.deinit()
             except AttributeError:
                 pass
-            del i2c_bus 
-            
+            del i2c_bus
+
         sys.exit(0)

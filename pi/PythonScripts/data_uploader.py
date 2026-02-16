@@ -1,207 +1,177 @@
 # -*- coding: utf-8 -*-
 """
-FIREBASE BULK UPLOADER (High Cost, Infrequent Run) - BATCH WRITE IMPLEMENTED
+DATA UPLOADER - Firebase Bulk Upload
 
-This script reads all local CSV data, uploads it to Firestore using efficient 
-**batch writes**, and then CLEARS the local file if the upload is successful.
+Reads local energy CSV data and uploads to Firestore using batch writes.
+Clears local file upon successful upload.
 
-CRITICAL FIXES: 
-1. The timestamp is uploaded as a raw string to bypass parsing errors.
-2. Writes are now grouped into atomic batches of up to 500 documents.
+Called by system_updater.py when app is open (immediate + periodic).
+Uses efficient batching to minimize Firestore write costs.
 """
 
 import os
 import sys
 import csv
 import traceback
-import json 
-from typing import Dict, Any, List
 
-# --- CONFIGURATION (Shared Constants & Firebase) ---
-LOCAL_LOG_FILE = "/home/wyattshore/Birdfeeder/Logs/energy_log.csv"
-# CORRECT Firestore Collection path for data logs: logs/energy/data
-ENERGY_DATA_COLLECTION_PATH = "logs/energy/data" 
-SERVICE_ACCOUNT_PATH = "/home/wyattshore/Birdfeeder/birdfeeder-sa.json"
-FIREBASE_PROJECT_ID = "birdfeeder-b6224" 
-MAX_BATCH_SIZE = 500 # Firestore limit for a single batch operation
+# Import shared configuration
+import shared_config as config
 
-# Camera Server Status Check Configuration
-CAMERA_STATUS_COLLECTION = "status"
-CAMERA_STATUS_DOCUMENT = "camera_ip" 
-CAMERA_STOPPED_FLAG = "STOPPED" # The value used when the server is intentionally off
+# Setup logging
+logger = config.setup_logging("data_uploader")
 
-# --- Heavy Imports ---
+# Firebase imports
 try:
-    import firebase_admin
-    from firebase_admin import credentials
     from firebase_admin import firestore
-    from firebase_admin.firestore import client as FirestoreClient 
 except ImportError:
-    print("FATAL ERROR: Firebase Admin SDK not found.")
+    logger.error("FATAL: Firebase Admin SDK not found. Install: pip install firebase-admin")
     sys.exit(1)
 
-# Global Firebase Objects
+# Global Firebase client
 db = None
 
-# --- Helper Functions ---
+# Firestore batch size limit
+MAX_BATCH_SIZE = 500
 
-def init_firebase():
-    """Initializes the Firebase Admin SDK and returns the client."""
+
+def init_firebase() -> bool:
+    """
+    Initialize Firebase Admin SDK.
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
     global db
 
-    if not os.path.exists(SERVICE_ACCOUNT_PATH):
-        print(f"FATAL ERROR: Service Account file not found at {SERVICE_ACCOUNT_PATH}")
-        return None
-
     try:
-        cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred, {'projectId': FIREBASE_PROJECT_ID})
-        
-        db = firestore.client()
-        print(">> Firebase client initialized.")
-        return db
+        db, _ = config.init_firebase(
+            app_name='data_uploader_app',
+            require_firestore=True,
+            require_storage=False
+        )
+        logger.info("Firebase initialized successfully")
+        return True
 
     except Exception as e:
-        print(f"FATAL ERROR: Firebase initialization failed. Check credentials: {e}")
-        return None
-
-def is_camera_server_running(db_client: FirestoreClient) -> bool:
-    """
-    Checks the Firestore status document to see if the camera server is active.
-    """
-    try:
-        doc_ref = db_client.collection(CAMERA_STATUS_COLLECTION).document(CAMERA_STATUS_DOCUMENT)
-        doc_snapshot = doc_ref.get()
-        
-        if doc_snapshot.exists:
-            status_data = doc_snapshot.to_dict()
-            ip_address = status_data.get('ip_address', CAMERA_STOPPED_FLAG)
-            
-            if ip_address != CAMERA_STOPPED_FLAG:
-                print(f">> Camera Server Detected RUNNING at IP: {ip_address}")
-                return True
-            else:
-                return False
-        
+        logger.error(f"Firebase initialization failed: {e}")
+        traceback.print_exc()
         return False
 
-    except Exception as e:
-        print(f"WARNING: Could not check camera status (Network Error): {e}")
-        return False
 
-def upload_local_data(db_client: FirestoreClient):
+def upload_local_data() -> None:
     """
-    Reads local CSV, uploads all rows using Firestore batch writes, 
-    and clears the file upon success.
+    Read local CSV and upload all rows using Firestore batch writes.
+    Clears file upon success.
     """
-
-    if not os.path.exists(LOCAL_LOG_FILE) or os.stat(LOCAL_LOG_FILE).st_size == 0:
-        print(">> Local buffer is empty. Nothing to upload.")
+    # Check if file exists and has data
+    if not os.path.exists(config.ENERGY_LOG_FILE):
+        logger.info("No local energy log file found - nothing to upload")
         return
 
-    print(f">> Reading data from {LOCAL_LOG_FILE}...")
+    if os.stat(config.ENERGY_LOG_FILE).st_size == 0:
+        logger.info("Local energy log is empty - nothing to upload")
+        return
+
+    logger.info(f"Reading data from {config.ENERGY_LOG_FILE}")
     data_rows = []
-    
-    # --- 1. Read and Prepare Data from CSV ---
+
+    # Read and parse CSV
     try:
-        with open(LOCAL_LOG_FILE, 'r', newline='') as f:
+        with open(config.ENERGY_LOG_FILE, 'r', newline='') as f:
             reader = csv.reader(f)
-            header = next(reader)  # Skip header row
+            header = next(reader)  # Skip header
+
             for row in reader:
-                if len(row) == 4:
-                    try:
-                        timestamp_string = row[0] # Raw string (e.g., "2025-11-06 21:03:00")
-                        solar_v = float(row[1])
-                        batt_v = float(row[2])
-                        batt_p = float(row[3])
-                        
-                    except (ValueError, IndexError) as ve:
-                        print(f"WARNING: Skipping row due to data/format error: {ve} - Row: {row}")
-                        continue
+                if len(row) != 4:
+                    logger.warning(f"Skipping malformed row: {row}")
+                    continue
+
+                try:
+                    timestamp_str = row[0]
+                    solar_v = float(row[1])
+                    battery_v = float(row[2])
+                    battery_p = float(row[3])
 
                     data_rows.append({
-                        "timestamp": timestamp_string,
+                        "timestamp": timestamp_str,
                         "solar": {"voltage": solar_v},
                         "battery": {
-                            "voltage": batt_v,
-                            "percent": batt_p
+                            "voltage": battery_v,
+                            "percent": battery_p
                         }
                     })
+
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Skipping row due to parse error: {e} - Row: {row}")
+                    continue
+
     except Exception as e:
-        print(f"FATAL ERROR: Failed to read CSV: {e}")
-        traceback.print_exc(file=sys.stdout)
+        logger.error(f"Failed to read CSV: {e}")
+        traceback.print_exc()
         return
 
     if not data_rows:
-        print(">> No valid rows to upload.")
+        logger.warning("No valid rows found in CSV")
         return
 
     total_records = len(data_rows)
-    print(f">> Preparing to upload {total_records} records using batching...")
+    logger.info(f"Uploading {total_records} records using batch writes")
 
-    collection_ref = db_client.collection("logs").document("energy").collection("data")
-    
-    # --- 2. Perform Batch Upload ---
-    batch = db_client.batch()
-    records_processed_in_batch = 0
-    total_successful_commits = 0
+    # Get collection reference
+    collection_ref = db.collection("logs").document("energy").collection("data")
+
+    # Batch upload
+    batch = db.batch()
+    records_in_batch = 0
+    total_uploaded = 0
     upload_failed = False
-    
+
     for i, record in enumerate(data_rows):
-        
-        # Get a new, unique document reference (Firestore assigns the ID)
-        doc_ref = collection_ref.document()
-        # Add the set operation to the current batch
+        # Add to batch
+        doc_ref = collection_ref.document()  # Auto-generated ID
         batch.set(doc_ref, record)
-        records_processed_in_batch += 1
-        
-        # If the batch is full or we are at the end of the data, commit
+        records_in_batch += 1
+
+        # Commit when batch is full or at end
         is_last_record = (i == total_records - 1)
-        
-        if records_processed_in_batch == MAX_BATCH_SIZE or is_last_record:
+
+        if records_in_batch == MAX_BATCH_SIZE or is_last_record:
             try:
-                # Commit the current batch
                 batch.commit()
-                total_successful_commits += records_processed_in_batch
-                print(f"✅ Batch committed successfully. Uploaded {total_successful_commits}/{total_records} records so far.")
-                
-                # Start a new batch for the next set of records
-                batch = db_client.batch()
-                records_processed_in_batch = 0
+                total_uploaded += records_in_batch
+                logger.info(f"Batch committed: {total_uploaded}/{total_records} records uploaded")
+
+                # Start new batch
+                batch = db.batch()
+                records_in_batch = 0
 
             except Exception as e:
-                # If a batch commit fails, the entire batch is rolled back.
-                # We stop the process, retain the file, and log the failure.
-                print(f"❌ FATAL BATCH COMMIT ERROR on record {i+1}: {e}")
-                traceback.print_exc(file=sys.stdout)
+                logger.error(f"Batch commit failed at record {i+1}: {e}")
+                traceback.print_exc()
                 upload_failed = True
-                break # Stop processing the rest of the records
+                break
 
-
-    # --- 3. Cleanup ---
-    if not upload_failed and total_successful_commits == total_records:
-        os.remove(LOCAL_LOG_FILE)
-        print(f"--- SUCCESS! Uploaded all {total_records} records and cleared local file. ---")
+    # Cleanup
+    if not upload_failed and total_uploaded == total_records:
+        try:
+            os.remove(config.ENERGY_LOG_FILE)
+            logger.info(f"SUCCESS: Uploaded all {total_records} records and cleared local file")
+        except Exception as e:
+            logger.warning(f"Uploaded successfully but failed to delete file: {e}")
     else:
-        print(f"--- FAILURE/INCOMPLETE! Uploaded {total_successful_commits}/{total_records} records. Local file retained for re-attempt. ---")
+        logger.error(f"FAILURE: Uploaded {total_uploaded}/{total_records} records - file retained")
 
-        
-# --- Main Execution Block ---
 
 if __name__ == "__main__":
-    
-    db_client = init_firebase()
-    if db_client is None:
+    # Initialize Firebase
+    if not init_firebase():
+        logger.error("Exiting due to Firebase initialization failure")
         sys.exit(1)
-        
-    if is_camera_server_running(db_client):
-        print("\n!!! CAMERA SERVER IS ACTIVE. Aborting data upload to prevent crash/conflict.")
-        sys.exit(0)
-    
-    print("-" * 50)
-    print("Camera server inactive. Starting bulk data upload.")
-    upload_local_data(db_client)
-    print("-" * 50)
-    
+
+    # Upload data
+    logger.info("=" * 60)
+    logger.info("Starting energy data upload")
+    upload_local_data()
+    logger.info("=" * 60)
+
     sys.exit(0)

@@ -1,335 +1,407 @@
 # -*- coding: utf-8 -*-
 """
-Reliable hardware-encoded TCP JPEG streamer + snapshot upload (single camera).
+CAMERA SERVER - TCP JPEG Streaming + Snapshot Upload
+
+Provides:
+1. Low-res hardware-encoded JPEG stream (lores) for live viewing
+2. High-res snapshot capture (main stream) with Firebase upload
 
 Protocol:
 - Stream: [4 bytes len little-endian][JPEG bytes]
 - Snapshot command: 0x01 0x01 -> server uploads snapshot and replies 'S' or 'F'
 
-*** FIX APPLIED: Using 'select' module for robust, non-blocking command reading. ***
-This prevents the client handler from exiting due to non-data-related socket errors 
-that occur when trying to read from an empty non-blocking buffer.
+Uses select module for robust, non-blocking command reading.
 """
-import io, socket, struct, threading, signal, time, sys, logging
+
+import io
+import socket
+import struct
+import threading
+import signal
+import time
+import sys
+import traceback
+import select
 from datetime import datetime
 from threading import Condition, Lock, Event
-import traceback 
-import select # Import the select module for robust polling
 
-# ---------- CONFIG ----------
-SERVER_ADDRESS, SERVER_PORT = '0.0.0.0', 8000
-STREAM_RES, SNAPSHOT_RES, FRAME_RATE = (640,360), (2560, 1440), 10   # 16:9
-CMD_PREFIX, CMD_SNAPSHOT, CMD_SIZE = b'\x01', b'\x01', 2
-# NOTE: Ensure this path and bucket match your setup
-SERVICE_ACCOUNT_PATH = '/home/wyattshore/Birdfeeder/birdfeeder-sa.json' 
-STORAGE_BUCKET = 'birdfeeder-b6224.firebasestorage.app'
-SNAPSHOT_PATH = 'media/snapshots'
+# Import shared configuration
+import shared_config as config
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("tcp_cam")
+# Setup logging
+log = config.setup_logging("camera_server")
 
-# ---------- IMPORTS ----------
+# Camera imports
 try:
     from picamera2 import Picamera2
     from picamera2.encoders import JpegEncoder
-    from picamera2.outputs import FileOutput # REQUIRED FOR THE FIX
+    from picamera2.outputs import FileOutput
 except ImportError:
-    sys.exit("Missing picamera2. Install: pip3 install picamera2")
+    log.error("Missing picamera2. Install: pip3 install picamera2")
+    sys.exit(1)
 
+# Firebase imports
 try:
-    import firebase_admin
-    from firebase_admin import credentials, storage, firestore
+    from firebase_admin import storage, firestore
     HAVE_FIREBASE = True
 except ImportError:
     HAVE_FIREBASE = False
     log.warning("Firebase SDK not found. Snapshots will not upload.")
 
-# ---------- GLOBAL LATEST FRAME ----------
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+SERVER_ADDRESS = config.CAMERA_SERVER_ADDRESS
+SERVER_PORT = config.CAMERA_SERVER_PORT
+STREAM_RES = config.DEFAULT_STREAM_RESOLUTION
+SNAPSHOT_RES = config.DEFAULT_SNAPSHOT_RESOLUTION
+FRAME_RATE = config.DEFAULT_FRAMERATE
+
+# Snapshot command protocol
+CMD_PREFIX = b'\x01'
+CMD_SNAPSHOT = b'\x01'
+CMD_SIZE = 2
+
+
+# ============================================================================
+# GLOBAL LATEST FRAME HOLDER
+# ============================================================================
+
 class LatestFrame:
-    """Holds the latest low-res JPEG frame produced by the encoder."""
+    """Thread-safe holder for the most recent JPEG frame."""
+
     def __init__(self):
         self.frame = None
         self.cond = Condition()
-    def set(self, b: bytes):
-        """Update frame and notify waiting sender threads."""
+
+    def set(self, data: bytes):
+        """Update frame and notify waiting threads."""
         with self.cond:
-            self.frame = b
+            self.frame = data
             self.cond.notify_all()
+
     def wait(self, timeout):
+        """Wait for next frame update."""
         with self.cond:
-            # waits for notification that the frame has been updated
             return self.cond.wait(timeout=timeout)
+
     def get(self):
+        """Get current frame."""
         return self.frame
+
 
 latest = LatestFrame()
 
-# ---------- STREAMER ----------
+
+# ============================================================================
+# STREAMER CLASS
+# ============================================================================
+
 class Streamer:
+    """Main streaming server with Firebase snapshot upload capability."""
+
     def __init__(self):
         self.picam2 = None
         self.running = True
         self.server_socket = None
         self.bucket = None
         self.db = None
-        self.camera_lock = Lock()  
+        self.camera_lock = Lock()
 
-    # Firebase
     def init_firebase(self):
-        if not HAVE_FIREBASE: return
-        if not firebase_admin._apps:
-            cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
-            firebase_admin.initialize_app(cred, {'storageBucket': STORAGE_BUCKET})
-        self.bucket = storage.bucket(STORAGE_BUCKET)
-        self.db = firestore.client()
-        log.info("Firebase connected")
+        """Initialize Firebase services."""
+        if not HAVE_FIREBASE:
+            log.warning("Firebase SDK not available - snapshots disabled")
+            return
+
+        try:
+            self.db, self.bucket = config.init_firebase(
+                app_name='camera_server_app',
+                require_firestore=True,
+                require_storage=True
+            )
+            log.info("Firebase connected")
+        except Exception as e:
+            log.error(f"Firebase initialization failed: {e}")
+            traceback.print_exc()
 
     def upload_snapshot(self, data: bytes, size_bytes: int, timestamp: str):
-        if not self.bucket: return
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = f"{SNAPSHOT_PATH}/snapshot_{ts}.jpg"
-        blob = self.bucket.blob(path)
+        """Upload snapshot to Firebase Storage and log metadata."""
+        if not self.bucket:
+            log.warning("Firebase not initialized - skipping upload")
+            return
 
-        # Set a timeout for the network operation
-        blob.upload_from_string(data, content_type='image/jpeg', timeout=30)
-        blob.make_public() #make image viewable
-        image_url = blob.public_url
-        log.info(f"Uploaded snapshot to storage: {path}")
+        try:
+            # Generate filename
+            filename = config.get_timestamp_filename(prefix="snapshot", extension="jpg")
+            storage_path = f"{config.SNAPSHOTS_STORAGE_PATH}/{filename}"
 
-        # 2. Firestore Logging
-        self.db.collection("logs").document("snapshots").collection("data").add({
-            "imageUrl": image_url, 
-            "resolution": f"{SNAPSHOT_RES[0]}x{SNAPSHOT_RES[1]}", 
-            "sizeBytes": size_bytes,
-            "storagePath": path,
-            "timestamp": timestamp, 
-        })
-        log.info(f"Logged metadata to Firestore: logs/snapshots/data")
+            # Upload to Storage
+            blob = self.bucket.blob(storage_path)
+            blob.upload_from_string(data, content_type='image/jpeg', timeout=30)
+            blob.make_public()
+            image_url = blob.public_url
+            log.info(f"Uploaded snapshot: {storage_path}")
 
-    # Networking helpers
+            # Log metadata to Firestore
+            self.db.collection("logs").document("snapshots").collection("data").add({
+                "imageUrl": image_url,
+                "resolution": f"{SNAPSHOT_RES[0]}x{SNAPSHOT_RES[1]}",
+                "sizeBytes": size_bytes,
+                "storagePath": storage_path,
+                "timestamp": timestamp,
+            })
+            log.info("Snapshot metadata logged to Firestore")
+
+        except Exception as e:
+            log.error(f"Snapshot upload failed: {e}")
+            traceback.print_exc()
+
     def send_packet(self, conn, payload: bytes):
-        """Sends a single payload following the [4 bytes len][payload] protocol."""
+        """Send payload with 4-byte length prefix."""
         size_prefix = struct.pack('<L', len(payload))
         conn.sendall(size_prefix)
         conn.sendall(payload)
 
-    # Camera: start lores encoding -> hardware JpegEncoder
     def start_camera(self):
+        """Start camera with hardware JPEG encoding."""
         self.picam2 = Picamera2()
-        
+
+        # Configure dual streams
         cfg = self.picam2.create_video_configuration(
-            # Main stream running high-res for immediate, high-quality snapshot capture
-            main={"size": SNAPSHOT_RES},
-            # Lores stream running low-res YUV for efficient hardware JPEG encoding
-            lores={"size": STREAM_RES, "format": "YUV420"},
-            queue=False, encode="lores"
+            main={"size": SNAPSHOT_RES},  # High-res for snapshots
+            lores={"size": STREAM_RES, "format": "YUV420"},  # Low-res for streaming
+            queue=False,
+            encode="lores"
         )
         self.picam2.configure(cfg)
         self.picam2.set_controls({'FrameRate': FRAME_RATE})
 
-        # FileOutput subclass: encoder thread will call write(buf)
+        # Frame writer for encoder output
         class FrameWriter(io.BufferedIOBase):
             def write(self_inner, buf: bytes):
-                # called by encoder thread; keep fast: replace latest frame and notify
                 latest.set(buf)
 
-        # *** FIX IS HERE ***
+        # Start hardware encoding
         output_wrapper = FileOutput(FrameWriter())
-        
-        # Start recording, piping JPEG frames from LORES stream directly to our buffer
         self.picam2.start_recording(JpegEncoder(), output_wrapper, name='lores')
-        log.info("Camera started with hardware JPEG encoder (lores)")
+        log.info(f"Camera started - stream: {STREAM_RES}, snapshot: {SNAPSHOT_RES}, {FRAME_RATE}fps")
 
-    # Snapshot: captures high-res frame, uploads to Firebase
     def take_snapshot(self, conn):
-        """Runs in a separate thread. Captures high-res, uploads, and sends confirmation."""
+        """Capture high-res snapshot and upload to Firebase."""
         ok = False
-        
+
         with self.camera_lock:
             try:
-                # 1. Capture High-Res Frame from the running 'main' stream
+                # Capture high-res frame
                 bio = io.BytesIO()
-                # capture_file on the main stream for a high-res JPEG
                 self.picam2.capture_file(bio, format='jpeg', name='main')
                 data = bio.getvalue()
                 size_bytes = len(data)
-                now = datetime.now()
-                timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
                 if not data:
-                    raise RuntimeError("Captured snapshot frame was empty.")
-                
-                # 2. Upload to Firebase
+                    raise RuntimeError("Captured frame was empty")
+
+                timestamp = config.get_timestamp_string()
+
+                # Upload to Firebase
                 if HAVE_FIREBASE:
                     self.upload_snapshot(data, size_bytes, timestamp)
-                
+
                 ok = True
-                log.info("Snapshot captured and uploaded successfully.")
+                log.info("Snapshot captured and uploaded successfully")
 
             except Exception as e:
-                log.error(f"Snapshot or upload failed: {e}")
-                log.error(tracebox.format_exc())
-        
-        # 3. Send confirmation (client may have disconnected)
+                log.error(f"Snapshot failed: {e}")
+                log.error(traceback.format_exc())
+
+        # Send confirmation to client
         try:
-            # IMPORTANT: Confirmation packet is always [4 bytes len=1][S/F]
             self.send_packet(conn, b'S' if ok else b'F')
         except Exception:
-            log.warning("Client disconnected before snapshot confirmation.")
+            log.warning("Client disconnected before snapshot confirmation")
 
-    # Per-client sender thread (consumes single-slot buffer)
     def client_sender(self, conn, stop_event: Event, slot: dict):
-        """Continuously pulls the latest frame from its slot and sends it."""
+        """Continuously send latest frames to client."""
         try:
             while not stop_event.is_set():
-                # Wait for a new frame, or timeout to check stop_event
+                # Wait for new frame
                 if not slot['event'].wait(timeout=0.5):
                     continue
                 slot['event'].clear()
-                
+
+                # Get frame from slot
                 with slot['lock']:
                     frame = slot.get('frame')
                     slot['frame'] = None
-                
+
                 if not frame:
                     continue
-                
-                # Send the frame
+
+                # Send frame
                 try:
                     self.send_packet(conn, frame)
-                # CRITICAL FIX: Gracefully handle network disconnects/slow clients
                 except (socket.error, BrokenPipeError, ConnectionResetError, OSError) as e:
-                    # Client abruptly closed the socket.
-                    log.warning(f"Sender network error: {e}. Disconnecting client.")
-                    # Trigger shutdown of the handler thread
+                    log.warning(f"Sender network error: {e}")
                     break
-        finally:
-            try: conn.close()
-            except: pass
-            log.info("Client sender thread finished.")
 
-    # Client handler: places newest frame into sender slot, reads commands
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+            log.info("Client sender thread finished")
+
     def handle_client(self, conn, addr):
+        """Handle client connection - send frames and process commands."""
         log.info(f"Client {addr} connected")
-        
+
+        # Setup sender thread
         slot = {'frame': None, 'lock': Lock(), 'event': Event()}
         stop_event = threading.Event()
-        # Use a non-daemon thread for the sender to ensure cleanup if main thread dies
-        sender = threading.Thread(target=self.client_sender, args=(conn, stop_event, slot), daemon=True) 
+        sender = threading.Thread(
+            target=self.client_sender,
+            args=(conn, stop_event, slot),
+            daemon=True
+        )
         sender.start()
-        
+
         read_buf = b''
-        timeout_s = 0.01 # Polling delay for select
-        
+        timeout_s = 0.01
+
         try:
             while self.running:
-                # 1. Check for incoming commands (non-blocking using select)
-                # Check the connection (conn) for readability (rlist) with a short timeout
+                # Check for incoming commands (non-blocking)
                 rlist, _, _ = select.select([conn], [], [], timeout_s)
-                
+
                 if rlist:
-                    # Data is available to read
+                    # Data available to read
                     try:
-                        # Now we call recv, knowing it won't block indefinitely
                         data = conn.recv(CMD_SIZE)
                         if not data:
-                            break # Client disconnected gracefully
+                            break  # Client disconnected
+
                         read_buf += data
-                        
-                        # Process commands in the buffer
+
+                        # Process commands in buffer
                         while len(read_buf) >= CMD_SIZE:
                             cmd = read_buf[:CMD_SIZE]
                             read_buf = read_buf[CMD_SIZE:]
-                            
-                            if cmd == CMD_PREFIX + CMD_SNAPSHOT:
-                                log.info(f"Received Snapshot Command {cmd.hex()} from {addr}. Starting upload thread.")
-                                # Pass the connection object to the snapshot thread
-                                threading.Thread(target=self.take_snapshot, args=(conn,), daemon=True).start()
-                            else:
-                                log.warning(f"Unknown cmd {cmd.hex()} from {addr}. "
-                                            "Ensure client sends raw 2-byte command (0x0101).")
-                                # If we get junk, clear the buffer to avoid getting stuck
-                                if len(read_buf) > 0:
-                                    log.warning(f"Discarding {len(read_buf)} remaining bytes in read buffer.")
-                                    read_buf = b''
 
+                            if cmd == CMD_PREFIX + CMD_SNAPSHOT:
+                                log.info(f"Snapshot command received from {addr}")
+                                threading.Thread(
+                                    target=self.take_snapshot,
+                                    args=(conn,),
+                                    daemon=True
+                                ).start()
+                            else:
+                                log.warning(f"Unknown command {cmd.hex()} from {addr}")
+                                read_buf = b''  # Clear buffer on junk
 
                     except socket.error as e:
-                        log.warning(f"Client {addr} socket read error: {e}. Closing connection.")
-                        break # Critical read error, break the client handler loop
-                
-                # 2. Wait for a new latest frame to send
-                # The timeout in latest.wait is essential to keep the loop responsive
-                if not latest.wait(timeout=0.1): 
+                        log.warning(f"Client {addr} socket error: {e}")
+                        break
+
+                # Wait for new frame
+                if not latest.wait(timeout=0.1):
                     continue
-                
-                # 3. Place frame in sender slot
+
+                # Place frame in sender slot
                 frame = latest.get()
-                if not frame:
-                    continue
-                    
-                with slot['lock']:
-                    slot['frame'] = frame 
-                    slot['event'].set() # Tell the sender thread the slot is full
-                    
+                if frame:
+                    with slot['lock']:
+                        slot['frame'] = frame
+                        slot['event'].set()
+
         except Exception as e:
-            log.critical(f"Client {addr} CRITICAL handler exception: {e}")
+            log.error(f"Client {addr} handler exception: {e}")
             log.error(traceback.format_exc())
-            
+
         finally:
-            stop_event.set() # Tells sender to stop
-            slot['event'].set() # Wake up sender if waiting
+            stop_event.set()
+            slot['event'].set()
             sender.join(timeout=1.0)
-            # This close should safely happen after the sender finishes
-            try: conn.close()
-            except: pass
+            try:
+                conn.close()
+            except:
+                pass
             log.info(f"Client {addr} disconnected")
 
-    # Listener
     def listen(self):
+        """Accept incoming client connections."""
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((SERVER_ADDRESS, SERVER_PORT))
         self.server_socket.listen(5)
+
         host_ip = socket.gethostbyname(socket.gethostname())
         log.info(f"Listening on tcp://{host_ip}:{SERVER_PORT}")
-        
-        self.server_socket.settimeout(0.5) 
+
+        self.server_socket.settimeout(0.5)
         while self.running:
             try:
                 conn, addr = self.server_socket.accept()
-                threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True).start()
+                threading.Thread(
+                    target=self.handle_client,
+                    args=(conn, addr),
+                    daemon=True
+                ).start()
             except socket.timeout:
                 continue
             except Exception:
-                if self.running: log.warning("Listener error during accept.")
+                if self.running:
+                    log.warning("Listener error during accept")
                 continue
 
     def serve(self):
+        """Start the streaming server."""
         self.init_firebase()
         self.start_camera()
+
+        # Start listener thread
         threading.Thread(target=self.listen, daemon=True).start()
+
+        # Setup signal handlers
         signal.signal(signal.SIGINT, lambda *_: self.stop())
         signal.signal(signal.SIGTERM, lambda *_: self.stop())
+
+        # Keep running
         while self.running:
             time.sleep(1)
 
     def stop(self):
+        """Shutdown server gracefully."""
         if not self.running:
             return
+
         self.running = False
+
         try:
-            if self.server_socket: self.server_socket.close()
+            if self.server_socket:
+                self.server_socket.close()
+
             if self.picam2:
-                try: self.picam2.stop_recording()
-                except: pass
-                try: self.picam2.close()
-                except: pass
+                try:
+                    self.picam2.stop_recording()
+                except:
+                    pass
+                try:
+                    self.picam2.close()
+                except:
+                    pass
         except Exception:
             pass
+
         log.info("Server stopped")
 
-# ---------- ENTRY ----------
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
 if __name__ == "__main__":
     try:
         Streamer().serve()

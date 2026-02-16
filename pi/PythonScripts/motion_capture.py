@@ -1,268 +1,283 @@
 # -*- coding: utf-8 -*-
+"""
+MOTION CAPTURE SCRIPT
+
+PIR-triggered photo capture with sustained motion filtering.
+Captures high-resolution photos when motion is detected for MIN_PULSE_DURATION
+seconds, then uploads to Firebase Storage and logs metadata to Firestore.
+
+Power optimization: Camera sensor is powered off when idle.
+"""
 
 import os
 import time
 import sys
-import json
-import traceback 
+import signal
+import traceback
+import threading
 from datetime import datetime
-import threading # <<< New import for the timer
-import signal 
 
-# --- Hardware Library Imports ---
+# Import shared configuration
+import shared_config as config
+
+# Hardware library imports
 try:
     from picamera2 import Picamera2
     from gpiozero import MotionSensor
 except ImportError as e:
-    print("FATAL ERROR: Hardware libraries (Picamera2 or gpiozero) not found.")
-    print("Please ensure they are installed: pip install picamera2 gpiozero")
-    print(f"Error details: {e}")
+    print(f"FATAL: Hardware libraries not found: {e}")
+    print("Install with: pip install picamera2 gpiozero")
     sys.exit(1)
 
-# Firebase Admin SDK imports
-try:
-    import firebase_admin
-    from firebase_admin import credentials
-    from firebase_admin import firestore
-    from firebase_admin import storage
-    from firebase_admin.exceptions import FirebaseError
-except ImportError:
-    print("FATAL ERROR: Firebase Admin SDK not found. Run: pip install firebase-admin")
-    sys.exit(1)
+# Setup logging
+logger = config.setup_logging("motion_capture")
 
-
-# --- Configuration (UPDATE THESE VALUES ON YOUR PI) ---
-SERVICE_ACCOUNT_PATH = "/home/wyattshore/Birdfeeder/birdfeeder-sa.json"
-FIREBASE_PROJECT_ID = "birdfeeder-b6224"
-STORAGE_BUCKET_NAME = f"{FIREBASE_PROJECT_ID}.firebasestorage.app" 
-
-# Camera and Motion Setup
-RESOLUTION = (4608, 2592)
-MOTION_PIN = 4
-CAMERA_WARMUP_TIME = 1.0 
-DEBOUNCE_DELAY = 0.2 
-MIN_PULSE_DURATION = 6.5 # <<< CRITICAL: The delay before capture executes
-
-# Local directory where pictures will be saved before upload attempt (The Queue)
-LOCAL_QUEUE_FOLDER = os.path.expanduser("~/upload_queue") 
-SIGHTINGS_STORAGE_FOLDER = "media/sightings/"
-
-# Global Firebase and Hardware Objects (Initialized below)
+# Global state
+picam2 = None
 db = None
 storage_bucket = None
-picam2 = None
-is_capturing = False # Flag to prevent multiple captures if camera is busy
-delayed_capture_timer = None # Tracks the background timer thread
+is_capturing = False
+delayed_capture_timer = None
 
 
 def init_firebase():
-    """Initializes the Firebase Admin SDK."""
+    """Initialize Firebase Admin SDK."""
     global db, storage_bucket
-    # ... (init_firebase remains the same)
     try:
-        if not os.path.exists(SERVICE_ACCOUNT_PATH):
-            print(f"FATAL ERROR: Service Account file not found at {SERVICE_ACCOUNT_PATH}")
-            sys.exit(1)
-        cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
-        firebase_admin.initialize_app(cred, {
-            'projectId': FIREBASE_PROJECT_ID,
-            'storageBucket': STORAGE_BUCKET_NAME
-        })
-        db = firestore.client()
-        storage_bucket = storage.bucket()
-        print(">> Firebase (Firestore/Storage) successfully initialized.")
+        db, storage_bucket = config.init_firebase(
+            app_name='motion_capture_app',
+            require_firestore=True,
+            require_storage=True
+        )
+        logger.info("Firebase initialized successfully")
         return True
     except Exception as e:
-        print(f"FATAL ERROR: Firebase initialization failed. Check credentials and network: {e}")
+        logger.error(f"Firebase initialization failed: {e}")
+        traceback.print_exc()
         return False
 
-def init_hardware():
-    """Sets up Picamera2 configuration but DOES NOT start the sensor."""
+
+def init_camera():
+    """Configure Picamera2 (does not start sensor)."""
     global picam2
-    # ... (init_hardware remains the same)
     try:
         picam2 = Picamera2()
-        config = picam2.create_still_configuration(main={"size": RESOLUTION})
-        picam2.configure(config)
-        print(f">> Camera configured at resolution: {RESOLUTION}.")
+        camera_config = picam2.create_still_configuration(
+            main={"size": config.DEFAULT_CAPTURE_RESOLUTION}
+        )
+        picam2.configure(camera_config)
+        logger.info(f"Camera configured at {config.DEFAULT_CAPTURE_RESOLUTION}")
         return True
     except Exception as e:
-        print(f"FATAL ERROR: Hardware initialization failed. Check camera ribbon/GPIO wiring: {e}")
+        logger.error(f"Camera initialization failed: {e}")
+        traceback.print_exc()
         return False
 
-def upload_and_log(filepath, filename, timestamp):
-    """Handles file upload to Storage and metadata logging to Firestore."""
-    # ... (upload_and_log remains the same)
+
+def upload_photo(filepath, filename, timestamp):
+    """
+    Upload photo to Firebase Storage and log metadata to Firestore.
+
+    Args:
+        filepath: Local path to photo file
+        filename: Name for the uploaded file
+        timestamp: Timestamp string for metadata
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
     if not db or not storage_bucket:
-        print("Warning: Skipping upload/log. Firebase services not initialized.")
+        logger.warning("Skipping upload - Firebase not initialized")
         return False
-    storage_path = f"{SIGHTINGS_STORAGE_FOLDER}{filename}" 
-    image_url = None
+
     try:
-        file_size_bytes = os.path.getsize(filepath)
-        print(f"-> Local file size measured: {round(file_size_bytes / 1024 / 1024, 2)} MB")
-    except Exception:
-        file_size_bytes = 0 
-    try:
+        # Get file size
+        file_size = os.path.getsize(filepath)
+        logger.info(f"Uploading {filename} ({file_size / 1024 / 1024:.2f} MB)")
+
+        # Upload to Storage
+        storage_path = f"{config.SIGHTINGS_STORAGE_PATH}/{filename}"
         blob = storage_bucket.blob(storage_path)
         blob.upload_from_filename(filepath)
         blob.make_public()
         image_url = blob.public_url
-        print(f"-> Uploaded capture to storage: {storage_path}")
-    except Exception as e:
-        print(f"? ERROR: Failed to upload {filename} to Firebase Storage: {e}")
-        os.rename(filepath, os.path.join(LOCAL_QUEUE_FOLDER, filename))
-        return False
-    try:
+        logger.info(f"Uploaded to {storage_path}")
+
+        # Log metadata to Firestore
         db.collection("logs").document("motion_captures").collection("data").add({
             "imageUrl": image_url,
-            "resolution": f"{RESOLUTION[0]}x{RESOLUTION[1]}",
-            "sizeBytes": file_size_bytes, 
+            "resolution": f"{config.DEFAULT_CAPTURE_RESOLUTION[0]}x{config.DEFAULT_CAPTURE_RESOLUTION[1]}",
+            "sizeBytes": file_size,
             "storagePath": storage_path,
             "timestamp": timestamp,
         })
-        print("-> Logged metadata to Firestore: logs/motion_captures/data")
+        logger.info("Metadata logged to Firestore")
+
+        # Clean up local file
         os.remove(filepath)
-        print("-> Cleaned up local file.")
+        logger.info("Local file cleaned up")
         return True
+
     except Exception as e:
-        print(f"? ERROR: Failed to log metadata to Firestore: {e}")
-        traceback.print_exc(file=sys.stdout)
+        logger.error(f"Upload failed: {e}")
+        traceback.print_exc()
+        # Move failed file back to queue for later retry
+        try:
+            os.rename(filepath, os.path.join(config.UPLOAD_QUEUE_DIR, filename))
+            logger.info("File moved to upload queue for retry")
+        except Exception:
+            pass
         return False
+
 
 def capture_sequence():
     """
-    Handles the photo capture, upload, and logging. 
-    Called by the timer thread AFTER 6.5s of sustained motion.
+    Execute photo capture, upload, and logging sequence.
+    Called by timer thread after MIN_PULSE_DURATION seconds of sustained motion.
     """
     global is_capturing, delayed_capture_timer
-    
+
     if is_capturing:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] - Timer expired, but camera is busy. Skipping.")
-        return 
+        logger.warning("Timer expired but camera busy - skipping capture")
+        return
 
     is_capturing = True
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] --- TIMER EXPIRED: SUSTAINED MOTION CONFIRMED. CAPTURING... ---")
-    
+    logger.info("=== SUSTAINED MOTION CONFIRMED - CAPTURING ===")
+
     try:
-        # 1. POWER ON THE CAMERA SENSOR
+        # Start camera sensor
         picam2.start()
-        print(f"-> Camera started. Waiting {CAMERA_WARMUP_TIME}s for stable image.")
-        time.sleep(CAMERA_WARMUP_TIME) 
-        
-        # a. Setup Filenames
+        logger.info(f"Camera started, warming up for {config.CAMERA_WARMUP_TIME}s")
+        time.sleep(config.CAMERA_WARMUP_TIME)
+
+        # Generate filename and path
         now = datetime.now()
-        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        filename = f"bird_{now.strftime('%Y%m%d-%H%M%S')}.jpg"
-        filepath = os.path.join(LOCAL_QUEUE_FOLDER, filename) 
-        
-        # b. Capture and Save Locally
+        timestamp = config.get_timestamp_string()
+        filename = config.get_timestamp_filename(prefix="bird", extension="jpg")
+        filepath = os.path.join(config.UPLOAD_QUEUE_DIR, filename)
+
+        # Capture photo
         picam2.capture_file(filepath)
-        print(f"-> Photo saved locally to queue: {filepath}")
-        
-        # c. Upload and Log 
-        upload_and_log(filepath, filename, timestamp)
-            
+        logger.info(f"Photo captured: {filepath}")
+
+        # Upload and log
+        upload_photo(filepath, filename, timestamp)
+
     except Exception as e:
-        print(f"? CRITICAL CAPTURE/UPLOAD ERROR: {e}")
-        traceback.print_exc(file=sys.stdout)
+        logger.error(f"Capture sequence failed: {e}")
+        traceback.print_exc()
 
     finally:
-        # 2. POWER OFF THE CAMERA SENSOR
+        # Stop camera sensor (power saving)
         try:
             picam2.stop()
-            print("-> Camera stopped/powered down.")
+            logger.info("Camera stopped")
         except Exception as e:
-            print(f"Warning: Could not stop camera properly: {e}")
-            
+            logger.warning(f"Could not stop camera: {e}")
+
         is_capturing = False
-        print("--- Capture sequence complete. Waiting for new motion. ---")
+        logger.info("=== Capture complete, waiting for motion ===\n")
 
-
-# --- Handlers for Threaded Timer Logic ---
 
 def motion_started():
     """
-    Handler for pir.when_motion. Starts the threaded timer.
+    PIR motion detected - start timer for sustained motion check.
+    Called by gpiozero when motion sensor triggers.
     """
     global delayed_capture_timer, is_capturing
 
     if is_capturing:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] - Motion detected, but capture is running. Ignoring.")
+        logger.debug("Motion detected but capture in progress - ignoring")
         return
 
-    # Cancel any existing, pending timer (shouldn't happen, but good practice)
+    # Cancel existing timer if motion re-detected
     if delayed_capture_timer and delayed_capture_timer.is_alive():
         delayed_capture_timer.cancel()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] - Motion re-detected, restarting {MIN_PULSE_DURATION}s timer.")
-    
-    # 1. Start the timer thread
-    delayed_capture_timer = threading.Timer(MIN_PULSE_DURATION, capture_sequence)
-    # Allows the timer thread to exit when the main program exits
-    delayed_capture_timer.daemon = True 
+        logger.info(f"Motion re-detected, restarting {config.MIN_PULSE_DURATION}s timer")
+
+    # Start new timer
+    delayed_capture_timer = threading.Timer(config.MIN_PULSE_DURATION, capture_sequence)
+    delayed_capture_timer.daemon = True
     delayed_capture_timer.start()
-    
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] --- Motion detected! {MIN_PULSE_DURATION}s timer started. ---")
+
+    logger.info(f"Motion detected - {config.MIN_PULSE_DURATION}s timer started")
 
 
 def motion_ended():
     """
-    Handler for pir.when_no_motion. Cancels the timer if motion stops early.
+    PIR motion stopped - cancel timer if motion was too brief.
+    Called by gpiozero when motion sensor deactivates.
     """
     global delayed_capture_timer
-    
+
     if delayed_capture_timer and delayed_capture_timer.is_alive():
-        # Motion stopped before the 6.5s delay expired. Cancel the capture.
         delayed_capture_timer.cancel()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] - Motion stopped early. Timer cancelled. False positive filtered.")
-        
-    # Reset the global variable after cancelling
+        logger.info("Motion stopped early - timer cancelled (false positive filtered)")
+
     delayed_capture_timer = None
 
 
-# --- Main Execution (Updated GPIO Setup) ---
+def cleanup():
+    """Clean up resources on shutdown."""
+    global delayed_capture_timer, picam2
+
+    logger.info("Shutting down...")
+
+    # Cancel any pending timer
+    if delayed_capture_timer and delayed_capture_timer.is_alive():
+        delayed_capture_timer.cancel()
+
+    # Stop camera if running
+    if picam2:
+        try:
+            if picam2.started:
+                picam2.stop()
+        except Exception:
+            pass
+
+    logger.info("Cleanup complete")
+
+
+def signal_handler(sig, frame):
+    """Handle shutdown signals gracefully."""
+    cleanup()
+    sys.exit(0)
+
+
 if __name__ == "__main__":
-    
-    # 1. Setup Local Queue Environment
-    if not os.path.exists(LOCAL_QUEUE_FOLDER):
-        os.makedirs(LOCAL_QUEUE_FOLDER)
-        print(f"Created local upload queue folder: {LOCAL_QUEUE_FOLDER}")
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-    # 2. Firebase Setup
-    if not init_firebase():
-        sys.exit(1)
-        
-    # 3. Camera Configuration
-    if not init_hardware():
-        print("Exiting due to critical hardware failure.")
-        sys.exit(1)
-
-    # 4. GPIO Setup
     try:
-        # Initialize MotionSensor.
-        pir = MotionSensor(MOTION_PIN, threshold=DEBOUNCE_DELAY)
-        
-        # Attach the custom timer start and cancel functions
-        pir.when_motion = motion_started
-        pir.when_no_motion = motion_ended 
-        
-        print(f"\n>> Motion detection ready on BCM Pin {MOTION_PIN} using gpiozero.")
-        print(f">> Capture Delay Filter: Capture occurs after {MIN_PULSE_DURATION} seconds of continuous motion.")
-        print(">> Camera is OFF (low-power state). Monitoring is ACTIVE. Press CTRL+C to exit.")
-        print("-" * 50)
+        # Ensure upload queue directory exists
+        config.ensure_directory_exists(config.UPLOAD_QUEUE_DIR)
 
-        # 5. Keep the main script running efficiently, waiting for events
+        # Initialize Firebase
+        if not init_firebase():
+            logger.error("Exiting due to Firebase initialization failure")
+            sys.exit(1)
+
+        # Initialize camera
+        if not init_camera():
+            logger.error("Exiting due to camera initialization failure")
+            sys.exit(1)
+
+        # Initialize PIR motion sensor
+        pir = MotionSensor(config.MOTION_PIN, threshold=config.DEBOUNCE_DELAY)
+        pir.when_motion = motion_started
+        pir.when_no_motion = motion_ended
+
+        logger.info(f"Motion detection active on GPIO pin {config.MOTION_PIN}")
+        logger.info(f"Sustained motion filter: {config.MIN_PULSE_DURATION}s")
+        logger.info("Camera is OFF (low-power mode). Press CTRL+C to exit")
+        logger.info("-" * 60)
+
+        # Keep script running and wait for motion events
         signal.pause()
 
-    except KeyboardInterrupt:
-        print("\nExiting program by user request...")
     except Exception as e:
-        print(f"An unexpected runtime error occurred: {e}")
-        traceback.print_exc(file=sys.stdout)
+        logger.error(f"Fatal error: {e}")
+        traceback.print_exc()
     finally:
-        # Cleanup the timer and camera
-        if delayed_capture_timer and delayed_capture_timer.is_alive():
-            delayed_capture_timer.cancel()
-        if picam2 and picam2.started:
-            picam2.stop()
-        print("Cleanup complete. Exiting.")
+        cleanup()
