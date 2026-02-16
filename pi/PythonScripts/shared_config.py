@@ -24,7 +24,7 @@ from typing import Optional
 # ============================================================================
 
 # Path to service account JSON file
-SERVICE_ACCOUNT_PATH = "/home/wyattshore/Birdfeeder/birdfeeder-sa.json"
+SERVICE_ACCOUNT_PATH = "/home/wyattshore/Birdfeeder/pi/birdfeeder-sa.json"
 
 # Firebase project ID
 FIREBASE_PROJECT_ID = "birdfeeder-b6224"
@@ -65,7 +65,7 @@ SNAPSHOTS_STORAGE_PATH = "media/snapshots"
 # ============================================================================
 
 # Base directory for all scripts
-SCRIPTS_DIR = "/home/wyattshore/Birdfeeder/PythonScripts"
+SCRIPTS_DIR = "/home/wyattshore/Birdfeeder/pi/PythonScripts"
 
 # Individual script paths
 CAMERA_SERVER_SCRIPT = os.path.join(SCRIPTS_DIR, "camera_server.py")
@@ -90,13 +90,13 @@ MOTION_CAPTURE_PID_FILE = os.path.join(PID_DIR, "motion_capture.pid")
 # ============================================================================
 
 # Base directory for birdfeeder files
-BASE_DIR = "/home/wyattshore/Birdfeeder"
+BASE_DIR = "/home/wyattshore/Birdfeeder/pi"
 
 # Local config file for camera settings
 LOCAL_CONFIG_FILE = os.path.join(BASE_DIR, "local_app_settings.json")
 
 # Queue folder for photos awaiting upload
-UPLOAD_QUEUE_DIR = os.path.expanduser("~/upload_queue")
+UPLOAD_QUEUE_DIR = os.path.join(BASE_DIR, "upload_queue")
 
 # Log directory
 LOGS_DIR = os.path.join(BASE_DIR, "Logs")
