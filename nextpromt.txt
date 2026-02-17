@@ -1,0 +1,8 @@
+okay we have an issue with the catalogging, i selected 6 photos and grouped them as a species, it removed them from the activity screen and created a new catalog entry. So far so good, except heres the issue, the bird profile still does not show the bird photos for that species and there are no histograms either. I think this is because when the bird photos were moved from the activity screen they were not referenced or placed in a useable location? Please have a look and try to sort this out. I think we are currently missing the data for each sighting in a catalog entry and that is why there are no images or data showing up. Currently i dont know where the 6 photos of that bird have moved to and would like to find them. 
+
+This catalogging system should work as follows:
+
+- The birds are identified from the activity screen and sorted into a catalog entery for their respective species
+- If a bird is mistakenly identified to the wrong species the user should be able to reidentify it which will move it to a different catalog entry, or unidentify it, which will move it back to the activity screen. 
+
+Also currently the header photo for the bird profile screen is obnoxiously huge, shrink it down to a reasonable size.

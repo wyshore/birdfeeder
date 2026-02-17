@@ -8,10 +8,13 @@ class Sighting {
   final String imageUrl;
   final String resolution;
 
-  // --- NEW CATALOG FIELDS ---
+  // Catalog fields
   final bool isIdentified;
-  final String catalogBirdId; // ID of the linked bird document (e.g., 'blue-jay-001')
+  final String catalogBirdId; // ID of the linked bird document (e.g., 'american-robin')
   final String speciesName;   // The human-readable name of the identified species
+
+  // Source type: 'motion_capture' or 'snapshot'
+  final String sourceType;
 
   Sighting({
     required this.id,
@@ -22,6 +25,7 @@ class Sighting {
     required this.isIdentified,
     required this.catalogBirdId,
     required this.speciesName,
+    this.sourceType = 'motion_capture',
   });
 
   /// Computed property to display "Unidentified" if tagging is pending.
@@ -57,11 +61,11 @@ class Sighting {
       imageUrl: fields['imageUrl'] as String? ?? '', 
       resolution: fields['resolution'] as String? ?? 'N/A', 
       
-      // Initialize new fields with safe defaults
       isIdentified: fields['isIdentified'] as bool? ?? false,
       catalogBirdId: fields['catalogBirdId'] as String? ?? '',
-      // We rename the old 'species' field to 'speciesName' for clarity in the model
-      speciesName: fields['species'] as String? ?? '',
+      // Read 'speciesName' first, fall back to old 'species' field for existing docs
+      speciesName: fields['speciesName'] as String? ?? fields['species'] as String? ?? '',
+      sourceType: fields['sourceType'] as String? ?? 'motion_capture',
     );
   }
 }

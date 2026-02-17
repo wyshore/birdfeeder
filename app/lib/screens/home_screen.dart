@@ -2,7 +2,7 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../config/firebase_paths.dart';
-import 'gallery_screen.dart';
+import 'activity_screen.dart';
 import 'catalog_screen.dart';
 import 'live_feed_screen.dart';
 import 'system_screen.dart';
@@ -19,7 +19,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // The screens for the bottom navigation bar
   static final List<Widget> _widgetOptions = <Widget>[
-    const GalleryScreen(),
+    const ActivityScreen(),
 
     const CatalogScreen(),
     
@@ -133,11 +133,11 @@ class _HomeScreenState extends State<HomeScreen> {
       bottomNavigationBar: BottomNavigationBar(
         items: const <BottomNavigationBarItem>[
           BottomNavigationBarItem(
-            icon: Icon(Icons.photo_library),
-            label: 'Gallery',
+            icon: Icon(Icons.camera_alt),
+            label: 'Activity',
           ),
           BottomNavigationBarItem(
-            icon: Icon(Icons.book_online),
+            icon: Icon(Icons.auto_stories),
             label: 'Catalog',
           ),
           BottomNavigationBarItem(

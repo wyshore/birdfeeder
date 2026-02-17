@@ -1,79 +1,57 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import '../models/bird.dart';
+import 'bird_profile_screen.dart';
 
-/// Represents a single identified bird in the public catalog.
-class Bird {
-  final String id;
-  final String commonName;
-  // Removed: final String scientificName;
-  final String description;
-  final String primaryImageUrl;
-  final int sightingCount;
-  final DateTime lastSeen;
+// ─────────────────────────────────────────────────────────────────────────────
+// Catalog Screen — list of identified bird species
+// ─────────────────────────────────────────────────────────────────────────────
 
-  Bird({
-    required this.id,
-    required this.commonName,
-    // Removed: required this.scientificName,
-    required this.description,
-    required this.primaryImageUrl,
-    required this.sightingCount,
-    required this.lastSeen,
-  });
+enum _SortMode { sightingCount, lastSeen }
 
-  /// Factory constructor to create a Bird instance from a Firestore document.
-  factory Bird.fromFirestore(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>;
-    return Bird(
-      id: doc.id,
-      commonName: data['commonName'] ?? 'Unknown Species',
-      // Removed: scientificName: data['scientificName'] ?? '',
-      description: data['description'] ?? '',
-      primaryImageUrl: data['primaryImageUrl'] ?? '',
-      sightingCount: (data['sightingCount'] as num?)?.toInt() ?? 0,
-      lastSeen: (data['lastSeen'] as Timestamp?)?.toDate() ?? DateTime.now(),
-    );
-  }
-
-  /// Static helper to generate the initial data map for a new catalog entry.
-  static Map<String, dynamic> createNewCatalogEntry({
-    required String speciesName,
-    required String imageStoragePath,
-    String description = 'A newly recorded species.',
-  }) {
-    // We removed the 'scientificName' field from the document map.
-    return {
-      'commonName': speciesName,
-      'description': description,
-      'primaryImageUrl': imageStoragePath,
-      'sightingCount': 1, // Start at 1 because this is the first sighting
-      'createdAt': FieldValue.serverTimestamp(),
-      'lastSeen': FieldValue.serverTimestamp(),
-    };
-  }
-}
-
-/// --- Main Catalog Screen ---
-class CatalogScreen extends StatelessWidget {
+class CatalogScreen extends StatefulWidget {
   const CatalogScreen({super.key});
 
   @override
+  State<CatalogScreen> createState() => _CatalogScreenState();
+}
+
+class _CatalogScreenState extends State<CatalogScreen> {
+  _SortMode _sortMode = _SortMode.sightingCount;
+
+  Query<Map<String, dynamic>> get _query {
+    final col = FirebaseFirestore.instance.collection(Bird.collectionPath);
+    return _sortMode == _SortMode.sightingCount
+        ? col.orderBy('sightingCount', descending: true).limit(100)
+        : col.orderBy('lastSeen', descending: true).limit(100);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    // This collection reference is the same one used for writing in gallery_screen.dart
-    final catalogCollection = FirebaseFirestore.instance
-        .collection('catalog')
-        .doc('birds')
-        .collection('data')
-        .orderBy('sightingCount', descending: true)
-        .limit(100);
+    final theme = Theme.of(context);
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Bird Catalog (Top Sightings)', style: TextStyle(fontWeight: FontWeight.bold)),
-        backgroundColor: Theme.of(context).primaryColor,
+        title: const Text('Bird Catalog', style: TextStyle(fontWeight: FontWeight.bold)),
+        backgroundColor: theme.primaryColor,
+        foregroundColor: Colors.white,
+        actions: [
+          IconButton(
+            tooltip: _sortMode == _SortMode.sightingCount ? 'Sort by last seen' : 'Sort by sighting count',
+            icon: Icon(
+              _sortMode == _SortMode.sightingCount ? Icons.access_time : Icons.format_list_numbered,
+            ),
+            onPressed: () => setState(() {
+              _sortMode = _sortMode == _SortMode.sightingCount
+                  ? _SortMode.lastSeen
+                  : _SortMode.sightingCount;
+            }),
+          ),
+        ],
       ),
       body: StreamBuilder<QuerySnapshot>(
-        stream: catalogCollection.snapshots(),
+        stream: _query.snapshots(),
         builder: (context, snapshot) {
           if (snapshot.hasError) {
             return Center(child: Text('Error loading catalog: ${snapshot.error}'));
@@ -82,68 +60,161 @@ class CatalogScreen extends StatelessWidget {
             return const Center(child: CircularProgressIndicator());
           }
 
-          final birds = snapshot.data!.docs
-              .map((doc) => Bird.fromFirestore(doc))
-              .toList();
+          final birds = snapshot.data!.docs.map((d) => Bird.fromFirestore(d)).toList();
 
           if (birds.isEmpty) {
-            return const Center(
-                child: Text('The catalog is empty! Identify a bird to add one.', style: TextStyle(fontSize: 18))
+            return Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.auto_stories, size: 72, color: Colors.grey.shade400),
+                  const SizedBox(height: 16),
+                  const Text('Catalog is empty', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Identify a sighting in Activity to add species here.',
+                    style: TextStyle(color: Colors.grey.shade600),
+                    textAlign: TextAlign.center,
+                  ),
+                ],
+              ),
             );
           }
 
           return ListView.builder(
-            padding: const EdgeInsets.all(12.0),
+            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
             itemCount: birds.length,
             itemBuilder: (context, index) {
               final bird = birds[index];
-              return Card(
-                elevation: 2,
-                margin: const EdgeInsets.symmetric(vertical: 8),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                child: ListTile(
-                  contentPadding: const EdgeInsets.all(8),
-                  leading: bird.primaryImageUrl.isNotEmpty
-                      ? ClipRRect(
-                          borderRadius: BorderRadius.circular(6),
-                          child: Image.network(
-                            bird.primaryImageUrl,
-                            width: 60,
-                            height: 60,
-                            fit: BoxFit.cover,
-                            errorBuilder: (context, error, stackTrace) =>
-                                const Icon(Icons.image_not_supported, size: 40, color: Colors.grey),
-                          ),
-                        )
-                      : const Icon(Icons.pets, size: 40, color: Colors.blueGrey),
-                  
-                  title: Text(
-                    bird.commonName, 
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)
-                  ),
-                  subtitle: Text(
-                    'Sighted ${bird.sightingCount} times (Last: ${bird.lastSeen.day}/${bird.lastSeen.month})',
-                    style: TextStyle(color: Colors.grey.shade600)
-                  ),
-                  trailing: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).primaryColor.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      '#${index + 1}',
-                      style: TextStyle(
-                        fontWeight: FontWeight.bold, 
-                        color: Theme.of(context).primaryColor
-                      ),
-                    ),
-                  ),
+              return _BirdCard(
+                bird: bird,
+                rank: index + 1,
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => BirdProfileScreen(bird: bird)),
                 ),
               );
             },
           );
         },
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bird Card
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _BirdCard extends StatelessWidget {
+  final Bird bird;
+  final int rank;
+  final VoidCallback onTap;
+
+  const _BirdCard({required this.bird, required this.rank, required this.onTap});
+
+  String _formatDate(DateTime dt) {
+    const months = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return '${months[dt.month]} ${dt.day}, ${dt.year}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Card(
+      elevation: 2,
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              // Rank badge
+              Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(
+                  color: rank == 1
+                      ? Colors.amber
+                      : rank == 2
+                          ? Colors.grey.shade400
+                          : rank == 3
+                              ? Colors.brown.shade300
+                              : theme.primaryColor.withValues(alpha:0.12),
+                  shape: BoxShape.circle,
+                ),
+                child: Center(
+                  child: Text(
+                    '#$rank',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 11,
+                      color: rank <= 3 ? Colors.white : theme.primaryColor,
+                    ),
+                  ),
+                ),
+              ),
+
+              const SizedBox(width: 12),
+
+              // Thumbnail
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: bird.primaryImageUrl.isNotEmpty
+                    ? CachedNetworkImage(
+                        imageUrl: bird.primaryImageUrl,
+                        width: 72,
+                        height: 72,
+                        fit: BoxFit.cover,
+                        errorWidget: (_, __, ___) =>
+                            const Icon(Icons.pets, size: 48, color: Colors.grey),
+                      )
+                    : Container(
+                        width: 72,
+                        height: 72,
+                        color: Colors.grey.shade200,
+                        child: const Icon(Icons.pets, size: 36, color: Colors.grey),
+                      ),
+              ),
+
+              const SizedBox(width: 14),
+
+              // Name + stats
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      bird.commonName,
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '${bird.sightingCount} sighting${bird.sightingCount != 1 ? 's' : ''}',
+                      style: TextStyle(color: theme.primaryColor, fontWeight: FontWeight.w500),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'First: ${_formatDate(bird.firstSeen)}',
+                      style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+                    ),
+                    Text(
+                      'Last: ${_formatDate(bird.lastSeen)}',
+                      style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+
+              const Icon(Icons.chevron_right, color: Colors.grey),
+            ],
+          ),
+        ),
       ),
     );
   }

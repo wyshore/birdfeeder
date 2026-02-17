@@ -146,6 +146,9 @@ def upload_photo(filepath, filename, timestamp):
             "sizeBytes": file_size,
             "storagePath": storage_path,
             "timestamp": timestamp,
+            "isIdentified": False,
+            "catalogBirdId": "",
+            "speciesName": "",
         })
         logger.info("Metadata logged to Firestore")
 
