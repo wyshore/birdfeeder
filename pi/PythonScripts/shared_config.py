@@ -118,6 +118,21 @@ DEFAULT_SNAPSHOT_RESOLUTION = (2560, 1440)  # High-res for manual snapshots
 DEFAULT_FRAMERATE = 10
 CAMERA_WARMUP_TIME = 1.0
 
+# Camera Controls (Picamera2 control names → default values)
+# These are applied during motion capture and can be overridden via the app.
+# Values use Picamera2's native control names for direct use with set_controls().
+DEFAULT_CAMERA_CONTROLS = {
+    "AfMode": 2,              # 0=manual, 1=single, 2=continuous
+    "AeEnable": True,         # Auto exposure on
+    "AwbEnable": True,        # Auto white balance on
+    "AwbMode": 0,             # 0=auto, 1=incandescent, 2=tungsten, 3=fluorescent, 4=indoor, 5=daylight, 6=cloudy
+    "Sharpness": 1.0,         # 0.0 - 16.0
+    "Contrast": 1.0,          # 0.0 - 32.0
+    "Saturation": 1.0,        # 0.0 - 32.0
+    "Brightness": 0.0,        # -1.0 - 1.0
+    "NoiseReductionMode": 2,  # 0=off, 1=fast, 2=high_quality
+}
+
 # ADC (ADS1115) Configuration
 ADC_ADDRESS = 0x48
 ADC_GAIN = 2/3  # Gain multiplier for ADS1115

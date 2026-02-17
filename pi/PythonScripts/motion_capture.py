@@ -13,6 +13,7 @@ import os
 import time
 import sys
 import signal
+import json
 import traceback
 import threading
 from datetime import datetime
@@ -38,6 +39,39 @@ db = None
 storage_bucket = None
 is_capturing = False
 delayed_capture_timer = None
+current_resolution = None  # Track configured resolution to detect changes
+
+
+def load_camera_settings():
+    """
+    Load camera controls and resolution from local config file.
+    Falls back to shared_config defaults if file is missing or invalid.
+
+    Returns:
+        tuple: (resolution, controls_dict)
+    """
+    resolution = config.DEFAULT_CAPTURE_RESOLUTION
+    controls = dict(config.DEFAULT_CAMERA_CONTROLS)
+
+    if os.path.exists(config.LOCAL_CONFIG_FILE):
+        try:
+            with open(config.LOCAL_CONFIG_FILE, 'r') as f:
+                settings = json.load(f)
+
+            # Resolution from local config
+            res = settings.get("motion_capture_resolution")
+            if isinstance(res, (list, tuple)) and len(res) >= 2:
+                resolution = (int(res[0]), int(res[1]))
+
+            # Camera controls from local config (merge over defaults)
+            saved_controls = settings.get("camera_controls")
+            if isinstance(saved_controls, dict):
+                controls.update(saved_controls)
+
+        except Exception as e:
+            logger.warning(f"Could not load local config, using defaults: {e}")
+
+    return resolution, controls
 
 
 def init_firebase():
@@ -58,15 +92,17 @@ def init_firebase():
 
 
 def init_camera():
-    """Configure Picamera2 (does not start sensor)."""
-    global picam2
+    """Configure Picamera2 with settings from local config (does not start sensor)."""
+    global picam2, current_resolution
     try:
+        resolution, _ = load_camera_settings()
         picam2 = Picamera2()
         camera_config = picam2.create_still_configuration(
-            main={"size": config.DEFAULT_CAPTURE_RESOLUTION}
+            main={"size": resolution}
         )
         picam2.configure(camera_config)
-        logger.info(f"Camera configured at {config.DEFAULT_CAPTURE_RESOLUTION}")
+        current_resolution = resolution
+        logger.info(f"Camera configured at {resolution}")
         return True
     except Exception as e:
         logger.error(f"Camera initialization failed: {e}")
@@ -106,7 +142,7 @@ def upload_photo(filepath, filename, timestamp):
         # Log metadata to Firestore
         db.collection("logs").document("motion_captures").collection("data").add({
             "imageUrl": image_url,
-            "resolution": f"{config.DEFAULT_CAPTURE_RESOLUTION[0]}x{config.DEFAULT_CAPTURE_RESOLUTION[1]}",
+            "resolution": f"{current_resolution[0]}x{current_resolution[1]}",
             "sizeBytes": file_size,
             "storagePath": storage_path,
             "timestamp": timestamp,
@@ -145,13 +181,32 @@ def capture_sequence():
     logger.info("=== SUSTAINED MOTION CONFIRMED - CAPTURING ===")
 
     try:
+        # Reload settings (may have changed via app since last capture)
+        resolution, controls = load_camera_settings()
+
+        # Reconfigure camera if resolution changed
+        if resolution != current_resolution:
+            logger.info(f"Resolution changed: {current_resolution} -> {resolution}")
+            camera_config = picam2.create_still_configuration(
+                main={"size": resolution}
+            )
+            picam2.configure(camera_config)
+            current_resolution = resolution
+
         # Start camera sensor
         picam2.start()
+
+        # Apply camera controls
+        try:
+            picam2.set_controls(controls)
+            logger.info(f"Camera controls applied: {controls}")
+        except Exception as e:
+            logger.warning(f"Some camera controls failed to apply: {e}")
+
         logger.info(f"Camera started, warming up for {config.CAMERA_WARMUP_TIME}s")
         time.sleep(config.CAMERA_WARMUP_TIME)
 
         # Generate filename and path
-        now = datetime.now()
         timestamp = config.get_timestamp_string()
         filename = config.get_timestamp_filename(prefix="bird", extension="jpg")
         filepath = os.path.join(config.UPLOAD_QUEUE_DIR, filename)

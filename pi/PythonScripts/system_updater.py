@@ -60,9 +60,10 @@ def load_local_config() -> Dict[str, Any]:
     return {
         "stream_resolution": list(config.DEFAULT_STREAM_RESOLUTION),
         "snapshot_resolution": list(config.DEFAULT_SNAPSHOT_RESOLUTION),
+        "motion_capture_resolution": list(config.DEFAULT_CAPTURE_RESOLUTION),
         "stream_framerate": config.DEFAULT_FRAMERATE,
-        "exposure_time": 0,
-        "controls": {"AwbEnable": True, "AeEnable": True}
+        "motion_capture_enabled": False,
+        "camera_controls": dict(config.DEFAULT_CAMERA_CONTROLS),
     }
 
 
@@ -81,6 +82,8 @@ def save_local_config(settings: Dict[str, Any]) -> None:
         logger.info(f"File: {config.LOCAL_CONFIG_FILE}")
         logger.info(f"Stream: {settings.get('stream_resolution')} @ {settings.get('stream_framerate')}fps")
         logger.info(f"Snapshot: {settings.get('snapshot_resolution')}")
+        logger.info(f"Motion capture: {settings.get('motion_capture_resolution')}")
+        logger.info(f"Camera controls: {settings.get('camera_controls')}")
 
     except Exception as e:
         logger.error(f"Failed to save local config: {e}")
@@ -125,6 +128,16 @@ def normalize_settings(doc_dict: Dict[str, Any]) -> Dict[str, Any]:
     if parsed_snap:
         out["snapshot_resolution"] = parsed_snap
 
+    # Motion capture resolution
+    mc_res = doc_dict.get("motion_capture_resolution")
+    parsed_mc = parse_resolution(mc_res)
+    if parsed_mc:
+        out["motion_capture_resolution"] = parsed_mc
+
+    # Motion capture enabled flag
+    if "motion_capture_enabled" in doc_dict:
+        out["motion_capture_enabled"] = bool(doc_dict["motion_capture_enabled"])
+
     # Stream framerate
     if "stream_framerate" in doc_dict:
         try:
@@ -132,22 +145,73 @@ def normalize_settings(doc_dict: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Exposure time
-    if "exposure_time" in doc_dict:
-        try:
-            out["exposure_time"] = int(doc_dict["exposure_time"])
-        except Exception:
-            pass
+    # --- Camera Controls ---
+    # Map Firestore field names to Picamera2 control names.
+    # Start from defaults, then override with any values from Firestore.
+    controls = dict(config.DEFAULT_CAMERA_CONTROLS)
 
-    # Camera controls
-    controls = doc_dict.get("controls")
-    if isinstance(controls, dict):
-        out["controls"] = controls
+    # Autofocus mode: "manual"=0, "single"=1, "continuous"=2
+    AF_MODE_MAP = {"manual": 0, "single": 1, "continuous": 2}
+    af = doc_dict.get("af_mode")
+    if af is not None:
+        controls["AfMode"] = AF_MODE_MAP.get(af, af) if isinstance(af, str) else int(af)
 
-    # Accept explicit keys if already in target schema
-    for key in ("stream_resolution", "snapshot_resolution", "stream_framerate", "exposure_time", "controls"):
-        if key in doc_dict and key not in out:
-            out[key] = doc_dict[key]
+    # Manual focus position (0.0 = infinity, larger = closer)
+    lens_pos = doc_dict.get("lens_position")
+    if lens_pos is not None:
+        controls["LensPosition"] = float(lens_pos)
+
+    # Exposure: 0 or absent = auto, >0 = manual (microseconds)
+    exp = doc_dict.get("exposure_time")
+    if exp is not None:
+        exp_val = int(exp)
+        if exp_val > 0:
+            controls["AeEnable"] = False
+            controls["ExposureTime"] = exp_val
+        else:
+            controls["AeEnable"] = True
+            controls.pop("ExposureTime", None)
+
+    # Analogue gain (null/0 = auto, >0 = manual)
+    gain = doc_dict.get("analogue_gain")
+    if gain is not None and float(gain) > 0:
+        controls["AnalogueGain"] = float(gain)
+
+    # AE exposure mode: "normal"=0, "short"=1, "long"=2, "custom"=3
+    AE_MODE_MAP = {"normal": 0, "short": 1, "long": 2, "custom": 3}
+    ae_mode = doc_dict.get("ae_exposure_mode")
+    if ae_mode is not None:
+        controls["AeExposureMode"] = AE_MODE_MAP.get(ae_mode, ae_mode) if isinstance(ae_mode, str) else int(ae_mode)
+
+    # EV compensation
+    ev = doc_dict.get("ev_compensation")
+    if ev is not None:
+        controls["ExposureValue"] = float(ev)
+
+    # Image processing controls
+    for firestore_key, picam2_key in [
+        ("sharpness", "Sharpness"),
+        ("contrast", "Contrast"),
+        ("saturation", "Saturation"),
+        ("brightness", "Brightness"),
+    ]:
+        val = doc_dict.get(firestore_key)
+        if val is not None:
+            controls[picam2_key] = float(val)
+
+    # Noise reduction: "off"=0, "fast"=1, "high_quality"=2
+    NR_MODE_MAP = {"off": 0, "fast": 1, "high_quality": 2}
+    nr = doc_dict.get("noise_reduction")
+    if nr is not None:
+        controls["NoiseReductionMode"] = NR_MODE_MAP.get(nr, nr) if isinstance(nr, str) else int(nr)
+
+    # AWB mode: "auto"=0, "incandescent"=1, "tungsten"=2, "fluorescent"=3, "indoor"=4, "daylight"=5, "cloudy"=6
+    AWB_MODE_MAP = {"auto": 0, "incandescent": 1, "tungsten": 2, "fluorescent": 3, "indoor": 4, "daylight": 5, "cloudy": 6}
+    awb = doc_dict.get("awb_mode")
+    if awb is not None:
+        controls["AwbMode"] = AWB_MODE_MAP.get(awb, awb) if isinstance(awb, str) else int(awb)
+
+    out["camera_controls"] = controls
 
     return out
 
