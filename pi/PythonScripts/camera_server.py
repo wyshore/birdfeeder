@@ -22,6 +22,8 @@ import time
 import sys
 import traceback
 import select
+import os
+import json
 from datetime import datetime
 from threading import Condition, Lock, Event
 
@@ -53,11 +55,51 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+def load_camera_settings():
+    """
+    Load camera resolution and framerate from local config file.
+    Falls back to defaults if file is missing or invalid.
+
+    Returns:
+        tuple: (stream_res, snapshot_res, framerate)
+    """
+    stream_res = config.DEFAULT_STREAM_RESOLUTION
+    snapshot_res = config.DEFAULT_SNAPSHOT_RESOLUTION
+    framerate = config.DEFAULT_FRAMERATE
+
+    if os.path.exists(config.LOCAL_CONFIG_FILE):
+        try:
+            with open(config.LOCAL_CONFIG_FILE, 'r') as f:
+                settings = json.load(f)
+
+            # Stream resolution
+            res = settings.get("stream_resolution")
+            if isinstance(res, (list, tuple)) and len(res) >= 2:
+                stream_res = (int(res[0]), int(res[1]))
+
+            # Snapshot resolution
+            snap = settings.get("snapshot_resolution")
+            if isinstance(snap, (list, tuple)) and len(snap) >= 2:
+                snapshot_res = (int(snap[0]), int(snap[1]))
+
+            # Framerate
+            fps = settings.get("stream_framerate")
+            if isinstance(fps, int):
+                framerate = fps
+
+        except Exception as e:
+            log.warning(f"Could not load local config, using defaults: {e}")
+
+    return stream_res, snapshot_res, framerate
+
+
 SERVER_ADDRESS = config.CAMERA_SERVER_ADDRESS
 SERVER_PORT = config.CAMERA_SERVER_PORT
-STREAM_RES = config.DEFAULT_STREAM_RESOLUTION
-SNAPSHOT_RES = config.DEFAULT_SNAPSHOT_RESOLUTION
-FRAME_RATE = config.DEFAULT_FRAMERATE
+STREAM_RES, SNAPSHOT_RES, FRAME_RATE = load_camera_settings()
 
 # Snapshot command protocol
 CMD_PREFIX = b'\x01'
