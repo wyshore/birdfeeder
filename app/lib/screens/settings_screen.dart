@@ -425,8 +425,7 @@ class _InputCardState extends State<_InputCard> {
     // Only update text if the value changed externally (e.g. Firestore sync)
     // and the field is not currently focused
     if (oldWidget.initialValue != widget.initialValue) {
-      final focusScope = FocusScope.of(context);
-      final hasFocus = _controller.selection.isValid && focusScope.hasFocus;
+      final hasFocus = _focusNode.hasFocus;
       if (!hasFocus) {
         _controller.text = widget.initialValue;
       }

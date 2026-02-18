@@ -105,7 +105,11 @@ def load_camera_settings():
 
 SERVER_ADDRESS = config.CAMERA_SERVER_ADDRESS
 SERVER_PORT = config.CAMERA_SERVER_PORT
-STREAM_RES, SNAPSHOT_RES, FRAME_RATE, CAMERA_CONTROLS = load_camera_settings()
+
+# Default values — will be overridden by load_camera_settings() in Streamer.start_camera()
+STREAM_RES = config.DEFAULT_STREAM_RESOLUTION
+SNAPSHOT_RES = config.DEFAULT_SNAPSHOT_RESOLUTION
+FRAME_RATE = config.DEFAULT_FRAMERATE
 
 # Snapshot command protocol
 CMD_PREFIX = b'\x01'
@@ -218,6 +222,15 @@ class Streamer:
 
     def start_camera(self):
         """Start camera with hardware JPEG encoding."""
+        global STREAM_RES, SNAPSHOT_RES, FRAME_RATE
+        
+        # Load camera settings (only when actually needed)
+        stream_res, snapshot_res, framerate, camera_controls = load_camera_settings()
+        STREAM_RES = stream_res
+        SNAPSHOT_RES = snapshot_res
+        FRAME_RATE = framerate
+        log.info(f"Camera settings loaded: stream={STREAM_RES}, snapshot={SNAPSHOT_RES}, fps={FRAME_RATE}")
+        
         self.picam2 = Picamera2()
 
         # Configure dual streams
@@ -230,7 +243,7 @@ class Streamer:
         self.picam2.configure(cfg)
 
         # Apply camera controls (sharpness, contrast, exposure, etc.)
-        all_controls = dict(CAMERA_CONTROLS)
+        all_controls = dict(camera_controls)
         all_controls['FrameRate'] = FRAME_RATE
         try:
             self.picam2.set_controls(all_controls)
