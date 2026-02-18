@@ -188,8 +188,9 @@ def capture_sequence():
         resolution, controls = load_camera_settings()
 
         # Reconfigure camera if resolution changed
-        if resolution != current_resolution:
-            logger.info(f"Resolution changed: {current_resolution} -> {resolution}")
+        if current_resolution is None or resolution != current_resolution:
+            if current_resolution is not None:
+                logger.info(f"Resolution changed: {current_resolution} -> {resolution}")
             camera_config = picam2.create_still_configuration(
                 main={"size": resolution}
             )
