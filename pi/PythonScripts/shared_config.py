@@ -50,6 +50,8 @@ ENERGY_DATA_COLLECTION = "logs/energy/data"
 MOTION_CAPTURES_COLLECTION = "logs/motion_captures/data"
 SNAPSHOTS_COLLECTION = "logs/snapshots/data"
 SIGHTINGS_COLLECTION = "logs/sightings/data"
+TEST_CAPTURE_STATUS_PATH = "status/test_capture"
+TEST_CAPTURES_COLLECTION = "logs/test_captures/history"
 
 
 # ============================================================================
@@ -58,6 +60,8 @@ SIGHTINGS_COLLECTION = "logs/sightings/data"
 
 SIGHTINGS_STORAGE_PATH = "media/sightings"
 SNAPSHOTS_STORAGE_PATH = "media/snapshots"
+TEST_CAPTURES_STORAGE_PATH = "media/test_captures"
+MAX_TEST_CAPTURES = 5
 
 
 # ============================================================================

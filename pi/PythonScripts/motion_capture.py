@@ -174,7 +174,7 @@ def capture_sequence():
     Execute photo capture, upload, and logging sequence.
     Called by timer thread after MIN_PULSE_DURATION seconds of sustained motion.
     """
-    global is_capturing, delayed_capture_timer
+    global is_capturing, delayed_capture_timer, current_resolution
 
     if is_capturing:
         logger.warning("Timer expired but camera busy - skipping capture")

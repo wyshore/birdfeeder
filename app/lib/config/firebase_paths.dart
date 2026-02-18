@@ -12,6 +12,7 @@ class StatusPaths {
   static const String heartbeat = 'status/heartbeat';
   static const String streamingEnabled = 'status/streaming_enabled';
   static const String appIsOpen = 'status/app_is_open';
+  static const String testCapture = 'status/test_capture';
 }
 
 /// Config document paths (Settings)
@@ -33,6 +34,9 @@ class LogPaths {
   /// Bird sightings collection (identified captures)
   static const String sightings = 'logs/sightings/data';
 
+  /// Test captures history
+  static const String testCaptures = 'logs/test_captures/history';
+
   /// Helper method to get log collection path by ID
   /// Used by gallery_screen.dart for dynamic tab switching
   static String getLogPath(String collectionId) {
@@ -44,4 +48,5 @@ class LogPaths {
 class StoragePaths {
   static const String sightings = 'media/sightings';
   static const String snapshots = 'media/snapshots';
+  static const String testCaptures = 'media/test_captures';
 }

@@ -390,11 +390,21 @@ class _InputCard extends StatefulWidget {
 
 class _InputCardState extends State<_InputCard> {
   late TextEditingController _controller;
+  late FocusNode _focusNode;
 
   @override
   void initState() {
     super.initState();
     _controller = TextEditingController(text: widget.initialValue);
+    _focusNode = FocusNode();
+    _focusNode.addListener(_onFocusChanged);
+  }
+
+  void _onFocusChanged() {
+    // Submit the value when focus is lost (e.g., when clicking Save button)
+    if (!_focusNode.hasFocus && _controller.text.isNotEmpty) {
+      widget.onSubmitted(_controller.text);
+    }
   }
 
   @override
@@ -413,6 +423,8 @@ class _InputCardState extends State<_InputCard> {
 
   @override
   void dispose() {
+    _focusNode.removeListener(_onFocusChanged);
+    _focusNode.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -447,6 +459,7 @@ class _InputCardState extends State<_InputCard> {
               width: 100,
               child: TextField(
                 controller: _controller,
+                focusNode: _focusNode,
                 keyboardType: TextInputType.numberWithOptions(decimal: widget.allowDecimal, signed: widget.allowNegative),
                 inputFormatters: formatters,
                 textAlign: TextAlign.center,

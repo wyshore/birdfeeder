@@ -14,6 +14,7 @@ import os
 import sys
 import signal
 import json
+import time
 import traceback
 import threading
 import subprocess
@@ -34,8 +35,10 @@ except ImportError:
 
 # Global state
 db = None
+storage_bucket = None
 main_thread_event = threading.Event()
 data_upload_stop_flag = threading.Event()
+is_test_capturing = False
 
 
 # ============================================================================
@@ -278,20 +281,20 @@ def data_upload_loop() -> None:
 
 def init_firebase() -> bool:
     """
-    Initialize Firebase Admin SDK.
+    Initialize Firebase Admin SDK with Firestore and Storage.
 
     Returns:
         True if successful, False otherwise
     """
-    global db
+    global db, storage_bucket
 
     try:
-        db, _ = config.init_firebase(
+        db, storage_bucket = config.init_firebase(
             app_name='system_updater_app',
             require_firestore=True,
-            require_storage=False
+            require_storage=True
         )
-        logger.info("Firebase initialized successfully")
+        logger.info("Firebase initialized successfully (Firestore + Storage)")
         return True
 
     except Exception as e:
@@ -340,6 +343,221 @@ def on_settings_snapshot(doc_snapshot, changes, read_time) -> None:
 
 
 # ============================================================================
+# TEST CAPTURE
+# ============================================================================
+
+def load_camera_settings():
+    """
+    Load camera resolution and controls from local config file.
+    Mirrors the logic in motion_capture.py.
+
+    Returns:
+        Tuple of (resolution_tuple, controls_dict)
+    """
+    resolution = config.DEFAULT_CAPTURE_RESOLUTION
+    controls = dict(config.DEFAULT_CAMERA_CONTROLS)
+
+    try:
+        if os.path.exists(config.LOCAL_CONFIG_FILE):
+            with open(config.LOCAL_CONFIG_FILE, 'r') as f:
+                local_config = json.load(f)
+
+            # Resolution
+            res = local_config.get("motion_capture_resolution")
+            if isinstance(res, (list, tuple)) and len(res) >= 2:
+                resolution = (int(res[0]), int(res[1]))
+
+            # Camera controls
+            saved_controls = local_config.get("camera_controls", {})
+            if saved_controls:
+                controls.update(saved_controls)
+
+    except Exception as e:
+        logger.warning(f"Could not load camera settings, using defaults: {e}")
+
+    return resolution, controls
+
+
+def cleanup_old_test_captures():
+    """Delete old test captures from Storage and Firestore, keeping the most recent ones."""
+    try:
+        from firebase_admin import firestore as firestore_module
+        history_ref = db.collection("logs").document("test_captures").collection("history")
+        docs = list(history_ref.order_by("timestamp", direction=firestore_module.Query.DESCENDING).stream())
+
+        if len(docs) <= config.MAX_TEST_CAPTURES:
+            return
+
+        old_docs = docs[config.MAX_TEST_CAPTURES:]
+        for doc in old_docs:
+            data = doc.to_dict()
+            # Delete from Storage
+            storage_path = data.get("storagePath")
+            if storage_path and storage_bucket:
+                try:
+                    blob = storage_bucket.blob(storage_path)
+                    blob.delete()
+                    logger.info(f"Deleted old test capture from storage: {storage_path}")
+                except Exception as e:
+                    logger.warning(f"Could not delete storage blob {storage_path}: {e}")
+            # Delete Firestore doc
+            doc.reference.delete()
+
+        logger.info(f"Cleaned up {len(old_docs)} old test capture(s)")
+
+    except Exception as e:
+        logger.warning(f"Test capture cleanup failed: {e}")
+
+
+def take_test_capture():
+    """
+    Take a single test photo using current camera settings and upload it.
+    Runs in a background thread to avoid blocking the Firestore listener.
+    """
+    global is_test_capturing
+
+    if is_test_capturing:
+        logger.warning("Test capture already in progress - ignoring")
+        return
+
+    is_test_capturing = True
+    logger.info("=== TEST CAPTURE REQUESTED ===")
+
+    picam2 = None
+    filepath = None
+
+    try:
+        # Lazy import — Picamera2 only available on the Pi
+        from picamera2 import Picamera2
+
+        # 1. Load current camera settings
+        resolution, controls = load_camera_settings()
+        logger.info(f"Test capture settings: {resolution}, controls: {controls}")
+
+        # 2. Initialize camera
+        picam2 = Picamera2()
+        camera_config = picam2.create_still_configuration(
+            main={"size": resolution}
+        )
+        picam2.configure(camera_config)
+
+        # 3. Start camera and apply controls
+        picam2.start()
+        try:
+            picam2.set_controls(controls)
+            logger.info("Camera controls applied")
+        except Exception as e:
+            logger.warning(f"Some camera controls failed to apply: {e}")
+
+        # 4. Wait for warmup
+        logger.info(f"Warming up camera for {config.CAMERA_WARMUP_TIME}s")
+        time.sleep(config.CAMERA_WARMUP_TIME)
+
+        # 5. Capture photo
+        timestamp = config.get_timestamp_string()
+        filename = config.get_timestamp_filename(prefix="test", extension="jpg")
+        config.ensure_directory_exists(config.UPLOAD_QUEUE_DIR)
+        filepath = os.path.join(config.UPLOAD_QUEUE_DIR, filename)
+        picam2.capture_file(filepath)
+        logger.info(f"Test photo captured: {filepath}")
+
+        # 6. Stop camera immediately (power saving)
+        picam2.stop()
+        picam2.close()
+        picam2 = None
+
+        # 7. Upload to Firebase Storage
+        file_size = os.path.getsize(filepath)
+        storage_path = f"{config.TEST_CAPTURES_STORAGE_PATH}/{filename}"
+        blob = storage_bucket.blob(storage_path)
+        blob.upload_from_filename(filepath)
+        blob.make_public()
+        image_url = blob.public_url
+        logger.info(f"Uploaded to {storage_path}")
+
+        # 8. Log to history collection
+        resolution_str = f"{resolution[0]}x{resolution[1]}"
+        db.collection("logs").document("test_captures").collection("history").add({
+            "imageUrl": image_url,
+            "resolution": resolution_str,
+            "sizeBytes": file_size,
+            "storagePath": storage_path,
+            "timestamp": timestamp,
+        })
+
+        # 9. Update status document with result
+        db.document(config.TEST_CAPTURE_STATUS_PATH).set({
+            "requested": False,
+            "imageUrl": image_url,
+            "resolution": resolution_str,
+            "timestamp": timestamp,
+        })
+        logger.info("Test capture result written to Firestore")
+
+        # 10. Clean up local file
+        os.remove(filepath)
+        filepath = None
+
+        # 11. Clean up old captures
+        cleanup_old_test_captures()
+
+        logger.info("=== TEST CAPTURE COMPLETE ===")
+
+    except Exception as e:
+        logger.error(f"Test capture failed: {e}")
+        traceback.print_exc()
+        # Write error back so the app knows it failed
+        try:
+            db.document(config.TEST_CAPTURE_STATUS_PATH).set({
+                "requested": False,
+                "error": str(e),
+                "timestamp": config.get_timestamp_string(),
+            })
+        except Exception:
+            pass
+
+    finally:
+        # Ensure camera is stopped
+        if picam2:
+            try:
+                picam2.stop()
+                picam2.close()
+            except Exception:
+                pass
+        # Clean up temp file if still present
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
+        is_test_capturing = False
+
+
+def on_test_capture_snapshot(doc_snapshot, changes, read_time) -> None:
+    """
+    Callback when status/test_capture document changes.
+    Triggers a test capture when requested == True.
+    """
+    if not doc_snapshot:
+        return
+
+    try:
+        doc_data = doc_snapshot[0].to_dict()
+        if not doc_data:
+            return
+
+        if doc_data.get("requested", False):
+            logger.info("Test capture request detected")
+            # Run in a thread to avoid blocking the listener
+            thread = threading.Thread(target=take_test_capture, daemon=True)
+            thread.start()
+
+    except Exception as e:
+        logger.error(f"Test capture listener error: {e}")
+        traceback.print_exc()
+
+
+# ============================================================================
 # SIGNAL HANDLING
 # ============================================================================
 
@@ -373,11 +591,16 @@ if __name__ == "__main__":
     initial_config = load_local_config()
     save_local_config(initial_config)
 
-    # Setup Firestore listener
+    # Setup Firestore listeners
     logger.info(f"Attaching listener to: {config.CONFIG_SETTINGS_PATH}")
     doc_ref = db.document(config.CONFIG_SETTINGS_PATH)
     unsubscribe_func = doc_ref.on_snapshot(on_settings_snapshot)
-    logger.info("System updater active - listening for config changes")
+
+    logger.info(f"Attaching listener to: {config.TEST_CAPTURE_STATUS_PATH}")
+    test_capture_ref = db.document(config.TEST_CAPTURE_STATUS_PATH)
+    unsubscribe_test_capture = test_capture_ref.on_snapshot(on_test_capture_snapshot)
+
+    logger.info("System updater active - listening for config changes and test captures")
     logger.info("-" * 60)
 
     try:
@@ -390,11 +613,12 @@ if __name__ == "__main__":
 
     finally:
         # Clean shutdown
-        if unsubscribe_func:
-            try:
-                unsubscribe_func.unsubscribe()
-            except Exception:
-                pass
+        for unsub in [unsubscribe_func, unsubscribe_test_capture]:
+            if unsub:
+                try:
+                    unsub.unsubscribe()
+                except Exception:
+                    pass
 
         logger.info("System updater shutdown complete")
         sys.exit(0)

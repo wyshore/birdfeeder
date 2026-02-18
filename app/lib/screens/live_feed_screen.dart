@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:async';
@@ -42,9 +43,16 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
   String _streamResolution = 'N/A';
   String _snapshotResolution = 'N/A';
   
-  // Firestore listener
+  // --- Test Capture State ---
+  String? _testCaptureUrl;
+  String? _selectedThumbnailUrl;
+  bool _isTestCaptureLoading = false;
+  String? _testCaptureError;
+
+  // Firestore listeners
   StreamSubscription? _statusSubscription;
   StreamSubscription? _configSubscription;
+  StreamSubscription? _testCaptureSubscription;
 
   // --- Buffer Management for Stream ---
   final List<int> _readBuffer = [];
@@ -63,6 +71,7 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
   void dispose() {
     _statusSubscription?.cancel();
     _configSubscription?.cancel();
+    _testCaptureSubscription?.cancel();
     _pulseTimer?.cancel();
     _disconnectSocket();
     super.dispose();
@@ -121,6 +130,28 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
       }
     }, onError: (error) {
       print("Error listening to config: $error");
+    });
+
+    // 3. Listen for test capture results
+    final testCaptureDoc = FirebaseFirestore.instance.doc(StatusPaths.testCapture);
+    _testCaptureSubscription = testCaptureDoc.snapshots().listen((snapshot) {
+      if (snapshot.exists && snapshot.data() != null) {
+        final data = snapshot.data()!;
+        final requested = data['requested'] as bool? ?? false;
+        final imageUrl = data['imageUrl'] as String?;
+        final error = data['error'] as String?;
+
+        setState(() {
+          _isTestCaptureLoading = requested;
+          _testCaptureError = error;
+          if (!requested && imageUrl != null && imageUrl.isNotEmpty) {
+            _testCaptureUrl = imageUrl;
+            _selectedThumbnailUrl = null;
+          }
+        });
+      }
+    }, onError: (error) {
+      print("Error listening to test capture status: $error");
     });
   }
 
@@ -291,6 +322,40 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
     }
   }
   
+  // --- Test Capture Methods ---
+
+  Future<void> _requestTestCapture() async {
+    if (_isTestCaptureLoading) return; // Debounce
+
+    // Check if Pi is online
+    if (!PiConnectionService().isOnline) {
+      if (mounted) {
+        _showSimpleMessage(context, 'Pi Offline', 'Cannot take test photo — Pi is not responding.');
+      }
+      return;
+    }
+
+    setState(() {
+      _isTestCaptureLoading = true;
+      _testCaptureError = null;
+    });
+
+    try {
+      await FirebaseFirestore.instance.doc(StatusPaths.testCapture).set({
+        'requested': true,
+        'timestamp': FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      print('Error requesting test capture: $e');
+      setState(() {
+        _isTestCaptureLoading = false;
+      });
+      if (mounted) {
+        _showSimpleMessage(context, 'Error', 'Failed to request test capture.');
+      }
+    }
+  }
+
   // --- UI Helper Methods ---
   
   // Helper for simple messages/toasts
@@ -381,7 +446,28 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
     final Widget controlButtons = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        // Snapshot Button (Icon Button)
+        // Test Capture Button (works without stream)
+        _isTestCaptureLoading
+            ? const SizedBox(
+                width: 30,
+                height: 30,
+                child: Padding(
+                  padding: EdgeInsets.all(4.0),
+                  child: CircularProgressIndicator(
+                    color: Colors.amber,
+                    strokeWidth: 2.5,
+                  ),
+                ),
+              )
+            : IconButton(
+                onPressed: _requestTestCapture,
+                icon: const Icon(Icons.photo_camera_outlined),
+                color: Colors.amber,
+                iconSize: 30,
+                tooltip: 'Test Capture (no stream needed)',
+              ),
+        const SizedBox(width: 6),
+        // Snapshot Button (requires stream)
         IconButton(
           onPressed: isConnected ? () => _takeSnapshot(context) : null,
           icon: const Icon(Icons.camera_alt),
@@ -390,8 +476,8 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
           iconSize: 30,
           tooltip: 'Take Snapshot',
         ),
-        const SizedBox(width: 10),
-        // Toggle Stream Button (Icon Button)
+        const SizedBox(width: 6),
+        // Toggle Stream Button
         IconButton(
           onPressed: _isConnecting ? null : _toggleStreaming,
           icon: Icon(_isStreamingEnabled ? Icons.stop : Icons.play_arrow),
@@ -422,6 +508,60 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
   
   // Placeholder for when the stream is off or disconnected
   Widget _buildPlaceholder() {
+    // Show test capture preview when stream is off and we have an image
+    final displayUrl = _selectedThumbnailUrl ?? _testCaptureUrl;
+    if (!_isStreamingEnabled && displayUrl != null) {
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          CachedNetworkImage(
+            imageUrl: displayUrl,
+            fit: BoxFit.contain,
+            placeholder: (context, url) => const Center(
+              child: CircularProgressIndicator(color: Colors.white54),
+            ),
+            errorWidget: (context, url, error) => const Center(
+              child: Icon(Icons.broken_image, color: Colors.white38, size: 60),
+            ),
+          ),
+          // Label overlay
+          Positioned(
+            top: 8,
+            left: 8,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Text(
+                'Test Capture',
+                style: TextStyle(color: Colors.amber, fontSize: 11),
+              ),
+            ),
+          ),
+          // Error overlay
+          if (_testCaptureError != null)
+            Positioned(
+              bottom: 8,
+              left: 8,
+              right: 8,
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.red.shade900.withValues(alpha: 0.8),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  'Error: $_testCaptureError',
+                  style: const TextStyle(color: Colors.white, fontSize: 11),
+                ),
+              ),
+            ),
+        ],
+      );
+    }
+
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -433,14 +573,102 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
           ),
           const SizedBox(height: 10),
           Text(
-            _isStreamingEnabled 
+            _isStreamingEnabled
                 ? 'Waiting for video data...\nCheck server connection.'
                 : 'Stream is currently stopped.\nTap the play button to start.',
             textAlign: TextAlign.center,
             style: const TextStyle(color: Colors.white54, fontSize: 16),
           ),
+          if (!_isStreamingEnabled) ...[
+            const SizedBox(height: 20),
+            Text(
+              'Use the test capture button to preview camera settings',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.amber.withValues(alpha: 0.6), fontSize: 12),
+            ),
+          ],
         ],
       ),
+    );
+  }
+
+  // Recent test captures thumbnail row
+  Widget _buildTestCaptureThumbnails() {
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection(LogPaths.testCaptures)
+          .orderBy('timestamp', descending: true)
+          .limit(5)
+          .snapshots(),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+          return const SizedBox.shrink();
+        }
+
+        final docs = snapshot.data!.docs;
+        return Container(
+          color: Colors.black,
+          padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+          height: 72,
+          child: Row(
+            children: [
+              const Text(
+                'Recent:',
+                style: TextStyle(color: Colors.white54, fontSize: 10),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: docs.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 6),
+                  itemBuilder: (context, index) {
+                    final data = docs[index].data() as Map<String, dynamic>;
+                    final url = data['imageUrl'] as String? ?? '';
+                    final isSelected = _selectedThumbnailUrl == url;
+
+                    return GestureDetector(
+                      onTap: () {
+                        setState(() {
+                          _selectedThumbnailUrl = isSelected ? null : url;
+                        });
+                      },
+                      child: Container(
+                        width: 80,
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: isSelected ? Colors.amber : Colors.white24,
+                            width: isSelected ? 2 : 1,
+                          ),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        clipBehavior: Clip.hardEdge,
+                        child: CachedNetworkImage(
+                          imageUrl: url,
+                          fit: BoxFit.cover,
+                          placeholder: (_, __) => const Center(
+                            child: SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 1.5,
+                                color: Colors.white38,
+                              ),
+                            ),
+                          ),
+                          errorWidget: (_, __, ___) => const Center(
+                            child: Icon(Icons.broken_image, color: Colors.white24, size: 20),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -562,6 +790,10 @@ Widget build(BuildContext context) {
   ),
 ),
 
+
+              // Test capture thumbnails (only shown when not streaming)
+              if (!_isStreamingEnabled)
+                _buildTestCaptureThumbnails(),
 
               // Control bar stays at bottom
               SafeArea(
