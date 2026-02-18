@@ -321,7 +321,7 @@ def on_settings_snapshot(doc_snapshot, changes, read_time) -> None:
 
     try:
         logger.info("*** Settings update received ***")
-        doc_data = doc_snapshot.to_dict()
+        doc_data = doc_snapshot[0].to_dict()
 
         if doc_data:
             logger.info(f"Raw data: {json.dumps(doc_data)}")
@@ -542,7 +542,7 @@ def on_test_capture_snapshot(doc_snapshot, changes, read_time) -> None:
         return
 
     try:
-        doc_data = doc_snapshot.to_dict()
+        doc_data = doc_snapshot[0].to_dict()
         if not doc_data:
             return
 

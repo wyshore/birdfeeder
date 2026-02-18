@@ -61,15 +61,16 @@ except ImportError:
 
 def load_camera_settings():
     """
-    Load camera resolution and framerate from local config file.
+    Load camera resolution, framerate, and controls from local config file.
     Falls back to defaults if file is missing or invalid.
 
     Returns:
-        tuple: (stream_res, snapshot_res, framerate)
+        tuple: (stream_res, snapshot_res, framerate, camera_controls)
     """
     stream_res = config.DEFAULT_STREAM_RESOLUTION
     snapshot_res = config.DEFAULT_SNAPSHOT_RESOLUTION
     framerate = config.DEFAULT_FRAMERATE
+    controls = dict(config.DEFAULT_CAMERA_CONTROLS)
 
     if os.path.exists(config.LOCAL_CONFIG_FILE):
         try:
@@ -91,15 +92,20 @@ def load_camera_settings():
             if isinstance(fps, int):
                 framerate = fps
 
+            # Camera controls
+            saved_controls = settings.get("camera_controls")
+            if isinstance(saved_controls, dict):
+                controls.update(saved_controls)
+
         except Exception as e:
             log.warning(f"Could not load local config, using defaults: {e}")
 
-    return stream_res, snapshot_res, framerate
+    return stream_res, snapshot_res, framerate, controls
 
 
 SERVER_ADDRESS = config.CAMERA_SERVER_ADDRESS
 SERVER_PORT = config.CAMERA_SERVER_PORT
-STREAM_RES, SNAPSHOT_RES, FRAME_RATE = load_camera_settings()
+STREAM_RES, SNAPSHOT_RES, FRAME_RATE, CAMERA_CONTROLS = load_camera_settings()
 
 # Snapshot command protocol
 CMD_PREFIX = b'\x01'
@@ -222,7 +228,17 @@ class Streamer:
             encode="lores"
         )
         self.picam2.configure(cfg)
-        self.picam2.set_controls({'FrameRate': FRAME_RATE})
+
+        # Apply camera controls (sharpness, contrast, exposure, etc.)
+        all_controls = dict(CAMERA_CONTROLS)
+        all_controls['FrameRate'] = FRAME_RATE
+        try:
+            self.picam2.set_controls(all_controls)
+            log.info(f"Camera controls applied: {all_controls}")
+        except Exception as e:
+            log.warning(f"Some camera controls failed to apply: {e}")
+            # Fall back to just framerate
+            self.picam2.set_controls({'FrameRate': FRAME_RATE})
 
         # Frame writer for encoder output
         class FrameWriter(io.BufferedIOBase):
