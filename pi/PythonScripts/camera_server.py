@@ -152,6 +152,9 @@ class Streamer:
                 "sizeBytes": size_bytes,
                 "storagePath": storage_path,
                 "timestamp": timestamp,
+                "isIdentified": False,
+                "catalogBirdId": "",
+                "speciesName": "",
             })
             log.info("Snapshot metadata logged to Firestore")
 
