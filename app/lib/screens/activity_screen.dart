@@ -23,6 +23,7 @@ class _ActivityScreenState extends State<ActivityScreen> {
   // Selection state
   final Set<String> _selectedIds = {};
   bool _isSelectionMode = false;
+  bool _isRefreshing = false;
 
   // Merged stream from both collections
   late final Stream<List<_TaggedSighting>> _unidentifiedStream;
@@ -231,6 +232,31 @@ class _ActivityScreenState extends State<ActivityScreen> {
     return groups;
   }
 
+  Future<void> _requestBatchUpload() async {
+    if (_isRefreshing) return;
+    setState(() => _isRefreshing = true);
+    try {
+      await FirebaseFirestore.instance
+          .doc(StatusPaths.batchUploadRequest)
+          .set({'requested': true});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Upload requested — new captures will appear shortly.'),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Failed to request upload: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _isRefreshing = false);
+    }
+  }
+
   String _formatDayHeader(String dateKey) {
     final parts = dateKey.split('-');
     final dt = DateTime(int.parse(parts[0]), int.parse(parts[1]), int.parse(parts[2]));
@@ -260,12 +286,27 @@ class _ActivityScreenState extends State<ActivityScreen> {
               onPressed: () => _toggleSelectionMode(false),
               child: const Text('Done', style: TextStyle(color: Colors.white)),
             )
-          else
+          else ...[
+            _isRefreshing
+                ? const Padding(
+                    padding: EdgeInsets.all(14),
+                    child: SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
+                    ),
+                  )
+                : IconButton(
+                    icon: const Icon(Icons.cloud_sync),
+                    onPressed: _requestBatchUpload,
+                    tooltip: 'Fetch new captures from Pi',
+                  ),
             IconButton(
               icon: const Icon(Icons.select_all),
               onPressed: () => _toggleSelectionMode(true),
               tooltip: 'Select',
             ),
+          ],
         ],
       ),
       body: StreamBuilder<List<_TaggedSighting>>(

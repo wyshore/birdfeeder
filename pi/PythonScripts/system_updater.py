@@ -141,6 +141,16 @@ def normalize_settings(doc_dict: Dict[str, Any]) -> Dict[str, Any]:
     if "motion_capture_enabled" in doc_dict:
         out["motion_capture_enabled"] = bool(doc_dict["motion_capture_enabled"])
 
+    # Motion duration threshold (seconds)
+    motion_thresh = doc_dict.get("motion_threshold_seconds")
+    if motion_thresh is not None:
+        try:
+            val = float(motion_thresh)
+            if 1.0 <= val <= 20.0:
+                out["motion_threshold_seconds"] = val
+        except (TypeError, ValueError):
+            pass
+
     # Stream framerate
     if "stream_framerate" in doc_dict:
         try:
@@ -251,17 +261,126 @@ def run_uploader() -> None:
         logger.error(f"Energy data upload exception: {e}")
 
 
+def batch_upload_queue() -> None:
+    """
+    Upload all queued motion capture photos to Firebase Storage and Firestore.
+
+    Iterates the local upload queue directory for 'bird_*.jpg' files,
+    uploads each to Storage, logs metadata to Firestore, and deletes the
+    local file on success. Called on app open and on manual refresh request.
+    """
+    if not db or not storage_bucket:
+        logger.warning("Batch upload skipped - Firebase not initialized")
+        return
+
+    if not os.path.exists(config.UPLOAD_QUEUE_DIR):
+        logger.info("Upload queue directory does not exist - nothing to upload")
+        return
+
+    queue_files = sorted([
+        f for f in os.listdir(config.UPLOAD_QUEUE_DIR)
+        if f.endswith('.jpg') and f.startswith('bird_')
+    ])
+
+    if not queue_files:
+        logger.info("Upload queue is empty - no motion captures to upload")
+        return
+
+    logger.info(f"=== BATCH UPLOAD: {len(queue_files)} file(s) in queue ===")
+
+    # Read current resolution from local config for metadata
+    local_cfg = load_local_config()
+    mc_res = local_cfg.get("motion_capture_resolution", [4608, 2592])
+    resolution_str = f"{mc_res[0]}x{mc_res[1]}"
+
+    success_count = 0
+    fail_count = 0
+
+    for filename in queue_files:
+        filepath = os.path.join(config.UPLOAD_QUEUE_DIR, filename)
+        try:
+            file_size = os.path.getsize(filepath)
+
+            # Upload to Firebase Storage
+            storage_path = f"{config.SIGHTINGS_STORAGE_PATH}/{filename}"
+            blob = storage_bucket.blob(storage_path)
+            blob.upload_from_filename(filepath)
+            blob.make_public()
+            image_url = blob.public_url
+
+            # Parse timestamp from filename: bird_YYYYMMDD_HHMMSS.jpg
+            try:
+                parts = filename.replace('.jpg', '').split('_')
+                if len(parts) >= 3:
+                    d, t = parts[1], parts[2]
+                    ts_str = f"{d[:4]}-{d[4:6]}-{d[6:8]} {t[:2]}:{t[2:4]}:{t[4:6]}"
+                else:
+                    ts_str = config.get_timestamp_string()
+            except Exception:
+                ts_str = config.get_timestamp_string()
+
+            # Log metadata to Firestore
+            db.collection("logs").document("motion_captures").collection("data").add({
+                "imageUrl": image_url,
+                "resolution": resolution_str,
+                "sizeBytes": file_size,
+                "storagePath": storage_path,
+                "timestamp": ts_str,
+                "isIdentified": False,
+                "catalogBirdId": "",
+                "speciesName": "",
+            })
+
+            os.remove(filepath)
+            success_count += 1
+            logger.info(f"Uploaded: {filename}")
+
+        except Exception as e:
+            fail_count += 1
+            logger.error(f"Failed to upload {filename}: {e}")
+            traceback.print_exc()
+
+    logger.info(f"=== BATCH UPLOAD DONE: {success_count} uploaded, {fail_count} failed ===")
+
+
+def on_batch_upload_snapshot(doc_snapshot, changes, read_time) -> None:
+    """
+    Callback when status/batch_upload_request document changes.
+    Triggers a batch upload when requested == True from the app.
+    """
+    if not doc_snapshot:
+        return
+
+    try:
+        doc_data = doc_snapshot[0].to_dict()
+        if not doc_data:
+            return
+
+        if doc_data.get("requested", False):
+            logger.info("Manual batch upload requested from app")
+            # Clear the flag immediately to prevent double-triggering
+            db.document(config.BATCH_UPLOAD_REQUEST_PATH).set({"requested": False})
+            thread = threading.Thread(target=batch_upload_queue, daemon=True)
+            thread.start()
+
+    except Exception as e:
+        logger.error(f"Batch upload listener error: {e}")
+        traceback.print_exc()
+
+
 def data_upload_loop() -> None:
     """
     Periodic data upload thread.
-    Runs immediately on startup, then every DATA_UPLOAD_INTERVAL seconds.
+    Runs immediately on startup (energy + queued motion captures),
+    then runs energy upload every DATA_UPLOAD_INTERVAL seconds.
     """
     logger.info("Data upload thread started - running initial upload")
 
     # Immediate upload on startup
     run_uploader()
+    batch_upload_queue()
 
-    # Periodic upload loop
+    # Periodic energy data upload loop
     while not data_upload_stop_flag.is_set():
         # Wait for interval (or until stop flag is set)
         data_upload_stop_flag.wait(config.DATA_UPLOAD_INTERVAL)
@@ -600,7 +719,11 @@ if __name__ == "__main__":
     test_capture_ref = db.document(config.TEST_CAPTURE_STATUS_PATH)
     unsubscribe_test_capture = test_capture_ref.on_snapshot(on_test_capture_snapshot)
 
-    logger.info("System updater active - listening for config changes and test captures")
+    logger.info(f"Attaching listener to: {config.BATCH_UPLOAD_REQUEST_PATH}")
+    batch_upload_ref = db.document(config.BATCH_UPLOAD_REQUEST_PATH)
+    unsubscribe_batch_upload = batch_upload_ref.on_snapshot(on_batch_upload_snapshot)
+
+    logger.info("System updater active - listening for config changes, test captures, and batch upload requests")
     logger.info("-" * 60)
 
     try:
@@ -613,7 +736,7 @@ if __name__ == "__main__":
 
     finally:
         # Clean shutdown
-        for unsub in [unsubscribe_func, unsubscribe_test_capture]:
+        for unsub in [unsubscribe_func, unsubscribe_test_capture, unsubscribe_batch_upload]:
             if unsub:
                 try:
                     unsub.unsubscribe()

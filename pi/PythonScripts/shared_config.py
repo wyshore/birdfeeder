@@ -52,6 +52,7 @@ SNAPSHOTS_COLLECTION = "logs/snapshots/data"
 SIGHTINGS_COLLECTION = "logs/sightings/data"
 TEST_CAPTURE_STATUS_PATH = "status/test_capture"
 TEST_CAPTURES_COLLECTION = "logs/test_captures/history"
+BATCH_UPLOAD_REQUEST_PATH = "status/batch_upload_request"
 
 
 # ============================================================================
@@ -157,7 +158,7 @@ ENERGY_LOG_FILE = os.path.join(LOGS_DIR, "energy_log.csv")
 # TIMING CONSTANTS
 # ============================================================================
 
-HEARTBEAT_INTERVAL = 30  # Seconds between heartbeat updates
+HEARTBEAT_INTERVAL = 60  # Seconds between heartbeat updates
 DATA_UPLOAD_INTERVAL = 600  # Seconds between energy data uploads (10 minutes)
 
 

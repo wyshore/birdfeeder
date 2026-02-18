@@ -8,7 +8,7 @@ WiFi stays on, but we reduce power through smarter upload patterns rather than W
 ## New Motion Capture Workflow
 
 ### 1. Local Queueing
-- PIR triggers → capture → save to `/home/wyattshore/upload_queue/` (no upload)
+- PIR triggers → capture → save locally (no upload)
 - Images accumulate throughout the day
 - No network activity during capture
 
@@ -35,11 +35,8 @@ WiFi stays on, but we reduce power through smarter upload patterns rather than W
 
 ## Additional Optimizations
 - Reduce heartbeat frequency: 30s → 60-120s (edit master_control.py)
-- Review `data_logger.py` cron frequency (reduce if too frequent)
-- Add "Low Power Mode" toggle in settings screen (disables streaming, reduces heartbeat)
 
 ## Testing
-- Deploy to Pi, let it capture for 24 hours without app open
 - Open app, verify batch upload works
 - Check queue is cleared
 - Measure: captures per day vs. uploads (should match)

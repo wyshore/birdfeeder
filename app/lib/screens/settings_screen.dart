@@ -119,6 +119,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     value: s.motionCaptureEnabled,
                     onChanged: (v) => _update(s.copyWith(motionCaptureEnabled: v)),
                   ),
+
+                  // ======== MOTION DETECTION ========
+                  _sectionHeader('Motion Detection'),
+                  _buildNumberCard(
+                    title: 'Motion Duration Threshold (s)',
+                    subtitle: 'Seconds of continuous motion required before capturing. Higher = fewer false positives. Default: 6.5',
+                    value: s.motionThresholdSeconds,
+                    min: 1.0,
+                    max: 20.0,
+                    decimals: 1,
+                    onChanged: (v) => _update(s.copyWith(motionThresholdSeconds: v)),
+                  ),
                   _buildStatusCard(title: 'Capture Resolution', value: fmtRes(s.motionCaptureResolution), icon: Icons.fullscreen),
                   _buildStatusCard(title: 'Stream Resolution (fixed)', value: fmtRes(s.streamResolution), icon: Icons.videocam_outlined),
 

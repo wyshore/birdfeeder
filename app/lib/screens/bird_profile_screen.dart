@@ -253,70 +253,25 @@ class _BirdProfileScreenState extends State<BirdProfileScreen> {
     );
   }
 
-  // ── Photo tap: fullscreen, cover, reassign, or unidentify ──────────────────
+  // ── Photo tap: open detail viewer with side actions ───────────────────────
 
   void _onPhotoTap(_ProfileSighting ps) {
-    showModalBottomSheet(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.fullscreen),
-              title: const Text('View fullscreen'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _viewFullscreen(ps.sighting.imageUrl);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.star),
-              title: const Text('Set as cover photo'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _setCoverPhoto(ps.sighting.imageUrl);
-              },
-            ),
-            const Divider(height: 1),
-            ListTile(
-              leading: const Icon(Icons.swap_horiz, color: Colors.orange),
-              title: const Text('Move to different species',
-                  style: TextStyle(color: Colors.orange)),
-              onTap: () {
-                Navigator.pop(ctx);
-                _openReassignSheet(ps);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.undo, color: Colors.red),
-              title: const Text('Unidentify (move to Activity)',
-                  style: TextStyle(color: Colors.red)),
-              onTap: () {
-                Navigator.pop(ctx);
-                _unidentify(ps);
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _viewFullscreen(String imageUrl) {
     showGeneralDialog(
       context: context,
-      barrierColor: Colors.black.withValues(alpha: 0.95),
+      barrierColor: Colors.black.withValues(alpha: 0.92),
       barrierDismissible: true,
       barrierLabel: 'Close',
-      transitionDuration: const Duration(milliseconds: 200),
-      pageBuilder: (ctx, a1, a2) => GestureDetector(
-        onTap: () => Navigator.pop(ctx),
-        child: Center(
-          child: InteractiveViewer(
-            child: CachedNetworkImage(imageUrl: imageUrl, fit: BoxFit.contain),
-          ),
-        ),
+      transitionDuration: const Duration(milliseconds: 280),
+      pageBuilder: (ctx, a1, a2) => _PhotoDetailScreen(
+        ps: ps,
+        bird: _bird,
+        onSetCover: () => _setCoverPhoto(ps.sighting.imageUrl),
+        onReassign: () => _openReassignSheet(ps),
+        onUnidentify: () => _unidentify(ps),
+      ),
+      transitionBuilder: (ctx, a1, a2, child) => SlideTransition(
+        position: Tween(begin: const Offset(0, 1), end: Offset.zero).animate(a1),
+        child: child,
       ),
     );
   }
@@ -870,6 +825,236 @@ class _ReassignSheetState extends State<_ReassignSheet> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Photo Detail Screen — fullscreen viewer with side action panel
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _PhotoDetailScreen extends StatefulWidget {
+  final _ProfileSighting ps;
+  final Bird bird;
+  final VoidCallback onSetCover;
+  final VoidCallback onReassign;
+  final VoidCallback onUnidentify;
+
+  const _PhotoDetailScreen({
+    required this.ps,
+    required this.bird,
+    required this.onSetCover,
+    required this.onReassign,
+    required this.onUnidentify,
+  });
+
+  @override
+  State<_PhotoDetailScreen> createState() => _PhotoDetailScreenState();
+}
+
+class _PhotoDetailScreenState extends State<_PhotoDetailScreen> {
+  final _transformController = TransformationController();
+
+  @override
+  void dispose() {
+    _transformController.dispose();
+    super.dispose();
+  }
+
+  double _parseAspectRatio(String res) {
+    final parts = res.split('x');
+    if (parts.length == 2) {
+      final w = double.tryParse(parts[0]);
+      final h = double.tryParse(parts[1]);
+      if (w != null && h != null && w > 0 && h > 0) return w / h;
+    }
+    return 16 / 9;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final sighting = widget.ps.sighting;
+    final aspectRatio = _parseAspectRatio(sighting.resolution);
+    final t = sighting.timestamp;
+    final timeStr =
+        '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}  '
+        '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Column(
+          children: [
+            // Header bar
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      widget.bird.commonName,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.zoom_out_map, color: Colors.white),
+                    onPressed: () => _transformController.value = Matrix4.identity(),
+                    tooltip: 'Reset zoom',
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white),
+                    onPressed: () => Navigator.pop(context),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(color: Colors.white24, height: 1),
+
+            // Body: zoomable image left, actions right
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Zoomable image
+                    Expanded(
+                      flex: 2,
+                      child: AspectRatio(
+                        aspectRatio: aspectRatio,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: Colors.grey.shade900,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                                color: theme.primaryColor.withValues(alpha: 0.6), width: 3),
+                          ),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(10),
+                            child: InteractiveViewer(
+                              transformationController: _transformController,
+                              boundaryMargin: EdgeInsets.zero,
+                              minScale: 1.0,
+                              maxScale: 5.0,
+                              child: CachedNetworkImage(
+                                imageUrl: sighting.imageUrl,
+                                fit: BoxFit.contain,
+                                placeholder: (_, __) => Center(
+                                  child: CircularProgressIndicator(
+                                      color: theme.primaryColor),
+                                ),
+                                errorWidget: (_, __, ___) => const Icon(
+                                    Icons.image_not_supported,
+                                    size: 80,
+                                    color: Colors.grey),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(width: 14),
+
+                    // Right action panel
+                    Expanded(
+                      flex: 1,
+                      child: Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade900,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: SingleChildScrollView(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              _metaRow('Captured', timeStr),
+                              _metaRow('Resolution', sighting.resolution),
+                              const Divider(color: Colors.white24, height: 28),
+
+                              // Set as cover
+                              ElevatedButton.icon(
+                                onPressed: () {
+                                  Navigator.pop(context);
+                                  widget.onSetCover();
+                                },
+                                icon: const Icon(Icons.star),
+                                label: const Text('Set as cover'),
+                                style: ElevatedButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                  backgroundColor: theme.primaryColor,
+                                  foregroundColor: Colors.white,
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+
+                              // Move to different species
+                              OutlinedButton.icon(
+                                onPressed: () {
+                                  Navigator.pop(context);
+                                  widget.onReassign();
+                                },
+                                icon: const Icon(Icons.swap_horiz),
+                                label: const Text('Move species'),
+                                style: OutlinedButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                  foregroundColor: Colors.orange.shade300,
+                                  side: BorderSide(color: Colors.orange.shade300),
+                                ),
+                              ),
+                              const SizedBox(height: 28),
+
+                              // Unidentify
+                              OutlinedButton.icon(
+                                onPressed: () {
+                                  Navigator.pop(context);
+                                  widget.onUnidentify();
+                                },
+                                icon: const Icon(Icons.undo),
+                                label: const Text('Unidentify'),
+                                style: OutlinedButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                  foregroundColor: Colors.red.shade400,
+                                  side: BorderSide(color: Colors.red.shade400),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _metaRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 80,
+            child: Text(label,
+                style: const TextStyle(color: Colors.white60, fontWeight: FontWeight.w500)),
+          ),
+          Expanded(
+            child: Text(value, style: const TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Cover Photo Card — contained photo, capped height
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1019,76 +1204,97 @@ class _TimeOfDayChart extends StatelessWidget {
           BarChartRodData(
             toY: counts[h].toDouble(),
             color: Theme.of(context).primaryColor,
-            width: 10,
+            width: 7,
             borderRadius: const BorderRadius.vertical(top: Radius.circular(3)),
           ),
         ],
       ),
     );
 
-    return SizedBox(
-      height: 180,
-      child: BarChart(BarChartData(
-        maxY: maxCount > 0 ? maxCount + 1 : 5,
-        barGroups: bars,
-        gridData: FlGridData(
-          show: true,
-          drawVerticalLine: false,
-          getDrawingHorizontalLine: (_) =>
-              FlLine(color: Colors.grey.shade200, strokeWidth: 1),
-        ),
-        borderData: FlBorderData(show: false),
-        titlesData: FlTitlesData(
-          leftTitles: AxisTitles(
-            sideTitles: SideTitles(
-              showTitles: true,
-              reservedSize: 28,
-              interval: maxCount > 4 ? (maxCount / 4).ceilToDouble() : 1,
-              getTitlesWidget: (v, _) => Text(v.toInt().toString(),
-                  style: const TextStyle(fontSize: 10, color: Colors.grey)),
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.grey.shade300, width: 1),
+        boxShadow: [
+          BoxShadow(color: Colors.grey.shade100, blurRadius: 4, offset: const Offset(0, 2)),
+        ],
+      ),
+      padding: const EdgeInsets.fromLTRB(8, 14, 12, 8),
+      child: SizedBox(
+        height: 160,
+        child: BarChart(BarChartData(
+          maxY: maxCount > 0 ? maxCount + 1 : 5,
+          barGroups: bars,
+          groupsSpace: 2,
+          gridData: FlGridData(
+            show: true,
+            drawVerticalLine: false,
+            getDrawingHorizontalLine: (_) =>
+                FlLine(color: Colors.grey.shade200, strokeWidth: 1),
+          ),
+          borderData: FlBorderData(
+            show: true,
+            border: Border(
+              bottom: BorderSide(color: Colors.grey.shade300),
+              left: BorderSide(color: Colors.grey.shade300),
             ),
           ),
-          bottomTitles: AxisTitles(
-            sideTitles: SideTitles(
-              showTitles: true,
-              interval: 3,
-              getTitlesWidget: (v, _) {
-                final h = v.toInt();
-                if (h % 3 != 0) return const SizedBox.shrink();
+          titlesData: FlTitlesData(
+            leftTitles: AxisTitles(
+              sideTitles: SideTitles(
+                showTitles: true,
+                reservedSize: 26,
+                interval: maxCount > 4 ? (maxCount / 4).ceilToDouble() : 1,
+                getTitlesWidget: (v, _) => Text(v.toInt().toString(),
+                    style: const TextStyle(fontSize: 9, color: Colors.grey)),
+              ),
+            ),
+            bottomTitles: AxisTitles(
+              sideTitles: SideTitles(
+                showTitles: true,
+                interval: 3,
+                getTitlesWidget: (v, _) {
+                  final h = v.toInt();
+                  if (h % 3 != 0) return const SizedBox.shrink();
+                  final lbl = h == 0
+                      ? '12a'
+                      : h < 12
+                          ? '${h}a'
+                          : h == 12
+                              ? '12p'
+                              : '${h - 12}p';
+                  return Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(lbl,
+                        style: const TextStyle(fontSize: 9, color: Colors.grey)),
+                  );
+                },
+              ),
+            ),
+            topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          ),
+          barTouchData: BarTouchData(
+            touchTooltipData: BarTouchTooltipData(
+              getTooltipItem: (group, _, rod, __) {
+                final h = group.x;
                 final lbl = h == 0
-                    ? '12a'
+                    ? '12am'
                     : h < 12
-                        ? '${h}a'
+                        ? '${h}am'
                         : h == 12
-                            ? '12p'
-                            : '${h - 12}p';
-                return Text(lbl,
-                    style: const TextStyle(fontSize: 9, color: Colors.grey));
+                            ? '12pm'
+                            : '${h - 12}pm';
+                return BarTooltipItem(
+                  '$lbl\n${rod.toY.toInt()} sighting${rod.toY.toInt() != 1 ? 's' : ''}',
+                  const TextStyle(color: Colors.white, fontSize: 12),
+                );
               },
             ),
           ),
-          topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-          rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-        ),
-        barTouchData: BarTouchData(
-          touchTooltipData: BarTouchTooltipData(
-            getTooltipItem: (group, _, rod, __) {
-              final h = group.x;
-              final lbl = h == 0
-                  ? '12am'
-                  : h < 12
-                      ? '${h}am'
-                      : h == 12
-                          ? '12pm'
-                          : '${h - 12}pm';
-              return BarTooltipItem(
-                '$lbl\n${rod.toY.toInt()} sighting${rod.toY.toInt() != 1 ? 's' : ''}',
-                const TextStyle(color: Colors.white, fontSize: 12),
-              );
-            },
-          ),
-        ),
-      )),
+        )),
+      ),
     );
   }
 }
@@ -1119,7 +1325,7 @@ class _TimeOfYearChart extends StatelessWidget {
           BarChartRodData(
             toY: counts[i].toDouble(),
             color: Colors.green.shade500,
-            width: 10,
+            width: 7,
             borderRadius: const BorderRadius.vertical(top: Radius.circular(3)),
           ),
         ],
@@ -1127,54 +1333,79 @@ class _TimeOfYearChart extends StatelessWidget {
     );
     const monthLabels = {0: 'Jan', 4: 'Mar', 8: 'May', 12: 'Jul', 17: 'Sep', 21: 'Nov'};
 
-    return SizedBox(
-      height: 180,
-      child: BarChart(BarChartData(
-        maxY: maxCount > 0 ? maxCount + 1 : 5,
-        barGroups: bars,
-        gridData: FlGridData(
-          show: true,
-          drawVerticalLine: false,
-          getDrawingHorizontalLine: (_) =>
-              FlLine(color: Colors.grey.shade200, strokeWidth: 1),
-        ),
-        borderData: FlBorderData(show: false),
-        titlesData: FlTitlesData(
-          leftTitles: AxisTitles(
-            sideTitles: SideTitles(
-              showTitles: true,
-              reservedSize: 28,
-              interval: maxCount > 4 ? (maxCount / 4).ceilToDouble() : 1,
-              getTitlesWidget: (v, _) => Text(v.toInt().toString(),
-                  style: const TextStyle(fontSize: 10, color: Colors.grey)),
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.grey.shade300, width: 1),
+        boxShadow: [
+          BoxShadow(color: Colors.grey.shade100, blurRadius: 4, offset: const Offset(0, 2)),
+        ],
+      ),
+      padding: const EdgeInsets.fromLTRB(8, 14, 12, 8),
+      child: SizedBox(
+        height: 160,
+        child: BarChart(BarChartData(
+          maxY: maxCount > 0 ? maxCount + 1 : 5,
+          barGroups: bars,
+          groupsSpace: 2,
+          gridData: FlGridData(
+            show: true,
+            drawVerticalLine: false,
+            getDrawingHorizontalLine: (_) =>
+                FlLine(color: Colors.grey.shade200, strokeWidth: 1),
+          ),
+          borderData: FlBorderData(
+            show: true,
+            border: Border(
+              bottom: BorderSide(color: Colors.grey.shade300),
+              left: BorderSide(color: Colors.grey.shade300),
             ),
           ),
-          bottomTitles: AxisTitles(
-            sideTitles: SideTitles(
-              showTitles: true,
-              getTitlesWidget: (v, _) {
-                final lbl = monthLabels[v.toInt()];
-                if (lbl == null) return const SizedBox.shrink();
-                return Text(lbl,
-                    style: const TextStyle(fontSize: 9, color: Colors.grey));
+          titlesData: FlTitlesData(
+            leftTitles: AxisTitles(
+              sideTitles: SideTitles(
+                showTitles: true,
+                reservedSize: 26,
+                interval: maxCount > 4 ? (maxCount / 4).ceilToDouble() : 1,
+                getTitlesWidget: (v, _) => Text(v.toInt().toString(),
+                    style: const TextStyle(fontSize: 9, color: Colors.grey)),
+              ),
+            ),
+            bottomTitles: AxisTitles(
+              sideTitles: SideTitles(
+                showTitles: true,
+                getTitlesWidget: (v, _) {
+                  final lbl = monthLabels[v.toInt()];
+                  if (lbl == null) return const SizedBox.shrink();
+                  return Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(lbl,
+                        style: const TextStyle(fontSize: 9, color: Colors.grey)),
+                  );
+                },
+              ),
+            ),
+            topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          ),
+          barTouchData: BarTouchData(
+            touchTooltipData: BarTouchTooltipData(
+              getTooltipItem: (group, _, rod, __) {
+                final startDay = group.x * 14 + 1;
+                const months = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+                final approxDate = DateTime(DateTime.now().year, 1, startDay);
+                final monthStr = months[approxDate.month];
+                return BarTooltipItem(
+                  '$monthStr ~${approxDate.day}\n${rod.toY.toInt()} sighting${rod.toY.toInt() != 1 ? 's' : ''}',
+                  const TextStyle(color: Colors.white, fontSize: 12),
+                );
               },
             ),
           ),
-          topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-          rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-        ),
-        barTouchData: BarTouchData(
-          touchTooltipData: BarTouchTooltipData(
-            getTooltipItem: (group, _, rod, __) {
-              final startDay = group.x * 14 + 1;
-              return BarTooltipItem(
-                'Day $startDay\u2013${startDay + 13}\n${rod.toY.toInt()} sighting${rod.toY.toInt() != 1 ? 's' : ''}',
-                const TextStyle(color: Colors.white, fontSize: 12),
-              );
-            },
-          ),
-        ),
-      )),
+        )),
+      ),
     );
   }
 }

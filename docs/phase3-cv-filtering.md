@@ -6,7 +6,6 @@
 - Make 6.5s threshold adjustable via app settings
 - Add field to `config/settings` Firestore doc
 - Update `motion_capture.py` to read threshold from config
-- Add slider in `settings_screen.dart`
 
 ## Part B: Local CV Filtering (Before Batch Upload)
 Runs on Pi when batch upload triggers (app opens), NOT during individual captures.

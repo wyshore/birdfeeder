@@ -8,6 +8,7 @@ class CameraSettings {
   // --- Configurable fields (set by app) ---
   final List<int> motionCaptureResolution;
   final bool motionCaptureEnabled;
+  final double motionThresholdSeconds; // Seconds of sustained motion before capture
 
   // Focus
   final String afMode; // "manual", "continuous"
@@ -35,6 +36,7 @@ class CameraSettings {
     required this.framerate,
     required this.motionCaptureResolution,
     required this.motionCaptureEnabled,
+    required this.motionThresholdSeconds,
     required this.afMode,
     required this.lensPosition,
     required this.exposureTime,
@@ -55,6 +57,7 @@ class CameraSettings {
     framerate: 10,
     motionCaptureResolution: [4608, 2592],
     motionCaptureEnabled: false,
+    motionThresholdSeconds: 6.5,
     afMode: 'continuous',
     lensPosition: 1.0,
     exposureTime: 0,
@@ -90,6 +93,7 @@ class CameraSettings {
       // Configurable
       motionCaptureResolution: toIntList(data['motion_capture_resolution'], d.motionCaptureResolution),
       motionCaptureEnabled: (data['motion_capture_enabled'] as bool?) ?? d.motionCaptureEnabled,
+      motionThresholdSeconds: (data['motion_threshold_seconds'] as num?)?.toDouble() ?? d.motionThresholdSeconds,
       afMode: (data['af_mode'] as String?) ?? d.afMode,
       lensPosition: (data['lens_position'] as num?)?.toDouble() ?? d.lensPosition,
       exposureTime: (data['exposure_time'] as num?)?.toInt() ?? d.exposureTime,
@@ -110,6 +114,7 @@ class CameraSettings {
     return {
       'motion_capture_resolution': motionCaptureResolution,
       'motion_capture_enabled': motionCaptureEnabled,
+      'motion_threshold_seconds': motionThresholdSeconds,
       'af_mode': afMode,
       'lens_position': lensPosition,
       'exposure_time': exposureTime,
@@ -131,6 +136,7 @@ class CameraSettings {
     int? framerate,
     List<int>? motionCaptureResolution,
     bool? motionCaptureEnabled,
+    double? motionThresholdSeconds,
     String? afMode,
     double? lensPosition,
     int? exposureTime,
@@ -150,6 +156,7 @@ class CameraSettings {
       framerate: framerate ?? this.framerate,
       motionCaptureResolution: motionCaptureResolution ?? this.motionCaptureResolution,
       motionCaptureEnabled: motionCaptureEnabled ?? this.motionCaptureEnabled,
+      motionThresholdSeconds: motionThresholdSeconds ?? this.motionThresholdSeconds,
       afMode: afMode ?? this.afMode,
       lensPosition: lensPosition ?? this.lensPosition,
       exposureTime: exposureTime ?? this.exposureTime,

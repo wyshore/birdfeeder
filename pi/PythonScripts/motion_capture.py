@@ -74,6 +74,27 @@ def load_camera_settings():
     return resolution, controls
 
 
+def load_motion_threshold():
+    """
+    Load motion duration threshold from local config file.
+    Falls back to shared_config default (MIN_PULSE_DURATION) if missing.
+
+    Returns:
+        float: Seconds of sustained motion required before capturing
+    """
+    threshold = config.MIN_PULSE_DURATION
+    if os.path.exists(config.LOCAL_CONFIG_FILE):
+        try:
+            with open(config.LOCAL_CONFIG_FILE, 'r') as f:
+                settings = json.load(f)
+            val = settings.get("motion_threshold_seconds")
+            if isinstance(val, (int, float)) and val >= 1.0:
+                threshold = float(val)
+        except Exception as e:
+            logger.warning(f"Could not load motion threshold, using default: {e}")
+    return threshold
+
+
 def init_firebase():
     """Initialize Firebase Admin SDK."""
     global db, storage_bucket
@@ -211,7 +232,6 @@ def capture_sequence():
         time.sleep(config.CAMERA_WARMUP_TIME)
 
         # Generate filename and path
-        timestamp = config.get_timestamp_string()
         filename = config.get_timestamp_filename(prefix="bird", extension="jpg")
         filepath = os.path.join(config.UPLOAD_QUEUE_DIR, filename)
 
@@ -219,8 +239,8 @@ def capture_sequence():
         picam2.capture_file(filepath)
         logger.info(f"Photo captured: {filepath}")
 
-        # Upload and log
-        upload_photo(filepath, filename, timestamp)
+        # File stays in upload queue — batch upload happens when app opens
+        logger.info(f"Photo queued for batch upload: {filename}")
 
     except Exception as e:
         logger.error(f"Capture sequence failed: {e}")
@@ -249,17 +269,20 @@ def motion_started():
         logger.debug("Motion detected but capture in progress - ignoring")
         return
 
+    # Read current threshold from config (allows live updates from app)
+    threshold = load_motion_threshold()
+
     # Cancel existing timer if motion re-detected
     if delayed_capture_timer and delayed_capture_timer.is_alive():
         delayed_capture_timer.cancel()
-        logger.info(f"Motion re-detected, restarting {config.MIN_PULSE_DURATION}s timer")
+        logger.info(f"Motion re-detected, restarting {threshold}s timer")
 
     # Start new timer
-    delayed_capture_timer = threading.Timer(config.MIN_PULSE_DURATION, capture_sequence)
+    delayed_capture_timer = threading.Timer(threshold, capture_sequence)
     delayed_capture_timer.daemon = True
     delayed_capture_timer.start()
 
-    logger.info(f"Motion detected - {config.MIN_PULSE_DURATION}s timer started")
+    logger.info(f"Motion detected - {threshold}s timer started")
 
 
 def motion_ended():
@@ -327,8 +350,9 @@ if __name__ == "__main__":
         pir.when_motion = motion_started
         pir.when_no_motion = motion_ended
 
+        initial_threshold = load_motion_threshold()
         logger.info(f"Motion detection active on GPIO pin {config.MOTION_PIN}")
-        logger.info(f"Sustained motion filter: {config.MIN_PULSE_DURATION}s")
+        logger.info(f"Sustained motion filter: {initial_threshold}s (configurable via app)")
         logger.info("Camera is OFF (low-power mode). Press CTRL+C to exit")
         logger.info("-" * 60)
 

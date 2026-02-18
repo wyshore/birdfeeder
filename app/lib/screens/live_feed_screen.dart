@@ -48,6 +48,7 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
   String? _selectedThumbnailUrl;
   bool _isTestCaptureLoading = false;
   String? _testCaptureError;
+  final _testCaptureTransformController = TransformationController();
 
   // Firestore listeners
   StreamSubscription? _statusSubscription;
@@ -73,6 +74,7 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
     _configSubscription?.cancel();
     _testCaptureSubscription?.cancel();
     _pulseTimer?.cancel();
+    _testCaptureTransformController.dispose();
     _disconnectSocket();
     super.dispose();
   }
@@ -147,6 +149,7 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
           if (!requested && imageUrl != null && imageUrl.isNotEmpty) {
             _testCaptureUrl = imageUrl;
             _selectedThumbnailUrl = null;
+            _testCaptureTransformController.value = Matrix4.identity();
           }
         });
       }
@@ -514,14 +517,21 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
       return Stack(
         fit: StackFit.expand,
         children: [
-          CachedNetworkImage(
-            imageUrl: displayUrl,
-            fit: BoxFit.contain,
-            placeholder: (context, url) => const Center(
-              child: CircularProgressIndicator(color: Colors.white54),
-            ),
-            errorWidget: (context, url, error) => const Center(
-              child: Icon(Icons.broken_image, color: Colors.white38, size: 60),
+          // Zoomable image
+          InteractiveViewer(
+            transformationController: _testCaptureTransformController,
+            boundaryMargin: EdgeInsets.zero,
+            minScale: 1.0,
+            maxScale: 6.0,
+            child: CachedNetworkImage(
+              imageUrl: displayUrl,
+              fit: BoxFit.contain,
+              placeholder: (context, url) => const Center(
+                child: CircularProgressIndicator(color: Colors.white54),
+              ),
+              errorWidget: (context, url, error) => const Center(
+                child: Icon(Icons.broken_image, color: Colors.white38, size: 60),
+              ),
             ),
           ),
           // Label overlay
@@ -538,6 +548,16 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
                 'Test Capture',
                 style: TextStyle(color: Colors.amber, fontSize: 11),
               ),
+            ),
+          ),
+          // Zoom reset button
+          Positioned(
+            top: 4,
+            right: 4,
+            child: IconButton(
+              icon: const Icon(Icons.zoom_out_map, color: Colors.white70, size: 20),
+              tooltip: 'Reset zoom',
+              onPressed: () => _testCaptureTransformController.value = Matrix4.identity(),
             ),
           ),
           // Error overlay
@@ -631,6 +651,7 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
                       onTap: () {
                         setState(() {
                           _selectedThumbnailUrl = isSelected ? null : url;
+                          _testCaptureTransformController.value = Matrix4.identity();
                         });
                       },
                       child: Container(

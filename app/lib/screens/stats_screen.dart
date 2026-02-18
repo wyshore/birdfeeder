@@ -200,25 +200,21 @@ class _StatsScreenState extends State<StatsScreen> {
               ),
             ),
             SizedBox(
-              height: 200,
+              height: 220,
               child: LineChart(
                 LineChartData(
-                  // Set min/max X and Y bounds
                   minX: minX,
                   maxX: maxX,
                   minY: minY,
                   maxY: maxY,
                   gridData: FlGridData(
                     show: true,
-                    drawVerticalLine: true,
+                    drawVerticalLine: false,
                     horizontalInterval: (maxY / 5).roundToDouble(),
-                    verticalInterval: intervalMilliseconds, // Use the dynamically calculated interval
-                    getDrawingHorizontalLine: (value) {
-                      return const FlLine(
-                        color: Color(0xff37434d),
-                        strokeWidth: 0.5,
-                      );
-                    },
+                    getDrawingHorizontalLine: (_) => FlLine(
+                      color: Colors.grey.shade200,
+                      strokeWidth: 1,
+                    ),
                   ),
                   titlesData: FlTitlesData(
                     show: true,
@@ -226,24 +222,21 @@ class _StatsScreenState extends State<StatsScreen> {
                       sideTitles: SideTitles(
                         showTitles: true,
                         getTitlesWidget: (value, meta) {
-                          // Convert timestamp back to DateTime for formatting
                           final dateTime = DateTime.fromMillisecondsSinceEpoch(value.toInt());
-                          
                           String text;
                           if (durationHours <= 24) {
-                            // Hourly labels for 24-hour chart (HH:mm)
                             text = '${dateTime.hour.toString().padLeft(2, '0')}:${dateTime.minute.toString().padLeft(2, '0')}';
                           } else {
-                            // Day labels for 7-day chart (MM/DD)
                             text = '${dateTime.month}/${dateTime.day}';
                           }
                           return Padding(
-                            padding: const EdgeInsets.only(top: 8.0),
-                            child: Text(text, style: const TextStyle(fontSize: 10)),
+                            padding: const EdgeInsets.only(top: 6.0),
+                            child: Text(text,
+                                style: TextStyle(fontSize: 10, color: Colors.grey.shade600)),
                           );
                         },
                         interval: intervalMilliseconds,
-                        reservedSize: 30,
+                        reservedSize: 28,
                       ),
                     ),
                     leftTitles: AxisTitles(
@@ -251,10 +244,10 @@ class _StatsScreenState extends State<StatsScreen> {
                         showTitles: showLeftTitles,
                         getTitlesWidget: (value, meta) {
                           return Text('${value.toInt()}$unitLabel',
-                              style: const TextStyle(fontSize: 10),
+                              style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
                               textAlign: TextAlign.left);
                         },
-                        reservedSize: 32,
+                        reservedSize: 38,
                         interval: (maxY / 5).roundToDouble(),
                       ),
                     ),
@@ -263,29 +256,52 @@ class _StatsScreenState extends State<StatsScreen> {
                   ),
                   borderData: FlBorderData(
                     show: true,
-                    border: Border.all(color: const Color(0xff37434d), width: 1),
+                    border: Border(
+                      bottom: BorderSide(color: Colors.grey.shade300),
+                      left: BorderSide(color: Colors.grey.shade300),
+                    ),
+                  ),
+                  lineTouchData: LineTouchData(
+                    touchTooltipData: LineTouchTooltipData(
+                      getTooltipColor: (_) => Colors.grey.shade800,
+                      getTooltipItems: (touchedSpots) {
+                        return touchedSpots.map((spot) {
+                          final dt = DateTime.fromMillisecondsSinceEpoch(spot.x.toInt());
+                          final dateStr =
+                              '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
+                          final timeStr =
+                              '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+                          return LineTooltipItem(
+                            '$dateStr\n$timeStr\n${spot.y.toStringAsFixed(1)}$unitLabel',
+                            const TextStyle(
+                                color: Colors.white, fontSize: 11, height: 1.5),
+                          );
+                        }).toList();
+                      },
+                    ),
+                    handleBuiltInTouches: true,
                   ),
                   lineBarsData: [
                     LineChartBarData(
                       spots: spots,
-                      isCurved: false, 
+                      isCurved: true,
+                      curveSmoothness: 0.3,
                       color: lineColor,
-                      barWidth: 3,
+                      barWidth: 2.5,
                       isStrokeCapRound: true,
-                      
                       dotData: FlDotData(
-                        show: true, 
-                        getDotPainter: (spot, percent, barData, index) => FlDotCirclePainter(
-                            radius: 3,
-                            color: lineColor.withOpacity(0.8), // Dot color
-                            strokeColor: Colors.white, // Border color
-                            strokeWidth: 1,
+                        show: true,
+                        getDotPainter: (spot, percent, barData, index) =>
+                            FlDotCirclePainter(
+                          radius: 2.5,
+                          color: lineColor,
+                          strokeColor: Colors.white,
+                          strokeWidth: 1,
                         ),
                       ),
-                      
                       belowBarData: BarAreaData(
                         show: true,
-                        color: lineColor.withOpacity(0.2),
+                        color: lineColor.withValues(alpha: 0.12),
                       ),
                     ),
                   ],

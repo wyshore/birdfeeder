@@ -13,6 +13,7 @@ class StatusPaths {
   static const String streamingEnabled = 'status/streaming_enabled';
   static const String appIsOpen = 'status/app_is_open';
   static const String testCapture = 'status/test_capture';
+  static const String batchUploadRequest = 'status/batch_upload_request';
 }
 
 /// Config document paths (Settings)
