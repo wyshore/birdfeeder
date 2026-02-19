@@ -8,7 +8,13 @@ class CameraSettings {
   // --- Configurable fields (set by app) ---
   final List<int> motionCaptureResolution;
   final bool motionCaptureEnabled;
-  final double motionThresholdSeconds; // Seconds of sustained motion before capture
+  final double motionThresholdSeconds; // Seconds of sustained motion (post-capture discard filter)
+
+  // Capture mode
+  final String captureMode;           // 'photo' | 'video'
+  final double photoCaptureInterval;  // Seconds between photos (1.0 - 60.0)
+  final String videoDurationMode;     // 'fixed' | 'motion'
+  final double videoFixedDuration;    // Seconds for fixed-length video (1.0 - 120.0)
 
   // Focus
   final String afMode; // "manual", "continuous"
@@ -37,6 +43,10 @@ class CameraSettings {
     required this.motionCaptureResolution,
     required this.motionCaptureEnabled,
     required this.motionThresholdSeconds,
+    required this.captureMode,
+    required this.photoCaptureInterval,
+    required this.videoDurationMode,
+    required this.videoFixedDuration,
     required this.afMode,
     required this.lensPosition,
     required this.exposureTime,
@@ -58,6 +68,10 @@ class CameraSettings {
     motionCaptureResolution: [4608, 2592],
     motionCaptureEnabled: false,
     motionThresholdSeconds: 6.5,
+    captureMode: 'photo',
+    photoCaptureInterval: 5.0,
+    videoDurationMode: 'motion',
+    videoFixedDuration: 10.0,
     afMode: 'continuous',
     lensPosition: 1.0,
     exposureTime: 0,
@@ -94,6 +108,10 @@ class CameraSettings {
       motionCaptureResolution: toIntList(data['motion_capture_resolution'], d.motionCaptureResolution),
       motionCaptureEnabled: (data['motion_capture_enabled'] as bool?) ?? d.motionCaptureEnabled,
       motionThresholdSeconds: (data['motion_threshold_seconds'] as num?)?.toDouble() ?? d.motionThresholdSeconds,
+      captureMode: (data['capture_mode'] as String?) ?? d.captureMode,
+      photoCaptureInterval: (data['photo_capture_interval'] as num?)?.toDouble() ?? d.photoCaptureInterval,
+      videoDurationMode: (data['video_duration_mode'] as String?) ?? d.videoDurationMode,
+      videoFixedDuration: (data['video_fixed_duration'] as num?)?.toDouble() ?? d.videoFixedDuration,
       afMode: (data['af_mode'] as String?) ?? d.afMode,
       lensPosition: (data['lens_position'] as num?)?.toDouble() ?? d.lensPosition,
       exposureTime: (data['exposure_time'] as num?)?.toInt() ?? d.exposureTime,
@@ -115,6 +133,10 @@ class CameraSettings {
       'motion_capture_resolution': motionCaptureResolution,
       'motion_capture_enabled': motionCaptureEnabled,
       'motion_threshold_seconds': motionThresholdSeconds,
+      'capture_mode': captureMode,
+      'photo_capture_interval': photoCaptureInterval,
+      'video_duration_mode': videoDurationMode,
+      'video_fixed_duration': videoFixedDuration,
       'af_mode': afMode,
       'lens_position': lensPosition,
       'exposure_time': exposureTime,
@@ -137,6 +159,10 @@ class CameraSettings {
     List<int>? motionCaptureResolution,
     bool? motionCaptureEnabled,
     double? motionThresholdSeconds,
+    String? captureMode,
+    double? photoCaptureInterval,
+    String? videoDurationMode,
+    double? videoFixedDuration,
     String? afMode,
     double? lensPosition,
     int? exposureTime,
@@ -157,6 +183,10 @@ class CameraSettings {
       motionCaptureResolution: motionCaptureResolution ?? this.motionCaptureResolution,
       motionCaptureEnabled: motionCaptureEnabled ?? this.motionCaptureEnabled,
       motionThresholdSeconds: motionThresholdSeconds ?? this.motionThresholdSeconds,
+      captureMode: captureMode ?? this.captureMode,
+      photoCaptureInterval: photoCaptureInterval ?? this.photoCaptureInterval,
+      videoDurationMode: videoDurationMode ?? this.videoDurationMode,
+      videoFixedDuration: videoFixedDuration ?? this.videoFixedDuration,
       afMode: afMode ?? this.afMode,
       lensPosition: lensPosition ?? this.lensPosition,
       exposureTime: exposureTime ?? this.exposureTime,

@@ -114,7 +114,14 @@ LOGS_DIR = os.path.join(BASE_DIR, "Logs")
 # PIR Motion Sensor
 MOTION_PIN = 4
 DEBOUNCE_DELAY = 0.2
-MIN_PULSE_DURATION = 6.5  # Seconds of sustained motion before capture
+MIN_PULSE_DURATION = 6.5  # Seconds of sustained motion before capture (post-capture discard filter)
+
+# Motion Capture Mode Settings
+DEFAULT_CAPTURE_MODE = 'photo'          # 'photo' | 'video'
+DEFAULT_PHOTO_INTERVAL = 5.0           # Seconds between photos in photo mode
+DEFAULT_VIDEO_DURATION_MODE = 'motion' # 'fixed' | 'motion'
+DEFAULT_VIDEO_FIXED_DURATION = 10.0    # Seconds for fixed-length video mode
+INSTANCE_METADATA_SUFFIX = '.meta.json'  # Sidecar file extension for upload queue
 
 # Camera Settings
 DEFAULT_CAPTURE_RESOLUTION = (4608, 2592)  # Full resolution for motion capture

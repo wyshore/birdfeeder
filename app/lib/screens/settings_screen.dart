@@ -134,6 +134,63 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   _buildStatusCard(title: 'Capture Resolution', value: fmtRes(s.motionCaptureResolution), icon: Icons.fullscreen),
                   _buildStatusCard(title: 'Stream Resolution (fixed)', value: fmtRes(s.streamResolution), icon: Icons.videocam_outlined),
 
+                  // ======== CAPTURE MODE ========
+                  _sectionHeader('Capture Mode'),
+                  _buildDropdownCard<String>(
+                    title: 'Capture Mode',
+                    value: s.captureMode,
+                    items: const {'photo': 'Photo Burst', 'video': 'Video'},
+                    onChanged: (v) => _update(s.copyWith(captureMode: v)),
+                  ),
+                  if (s.captureMode == 'photo')
+                    _buildNumberCard(
+                      title: 'Photo Interval (s)',
+                      subtitle: 'Seconds between photos while motion is active. 0.5 - 60.0. Default: 5.0',
+                      value: s.photoCaptureInterval,
+                      min: 0.5,
+                      max: 60.0,
+                      decimals: 1,
+                      onChanged: (v) => _update(s.copyWith(photoCaptureInterval: v)),
+                    ),
+                  if (s.captureMode == 'video') ...[
+                    _buildDropdownCard<String>(
+                      title: 'Video Duration',
+                      value: s.videoDurationMode,
+                      items: const {'motion': 'Full Motion Duration', 'fixed': 'Fixed Length'},
+                      onChanged: (v) => _update(s.copyWith(videoDurationMode: v)),
+                    ),
+                    if (s.videoDurationMode == 'fixed')
+                      _buildNumberCard(
+                        title: 'Fixed Duration (s)',
+                        subtitle: 'Length of each recording. 1.0 - 120.0. Default: 10.0',
+                        value: s.videoFixedDuration,
+                        min: 1.0,
+                        max: 120.0,
+                        decimals: 1,
+                        onChanged: (v) => _update(s.copyWith(videoFixedDuration: v)),
+                      ),
+                    Card(
+                      elevation: 2,
+                      color: Colors.orange.shade50,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      child: Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: Row(
+                          children: [
+                            Icon(Icons.bolt, color: Colors.orange.shade700),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                'Video mode uses significantly more battery than photo mode.',
+                                style: TextStyle(color: Colors.orange.shade900, fontSize: 13),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+
                   // ======== FOCUS ========
                   _sectionHeader('Focus'),
                   _buildDropdownCard<String>(

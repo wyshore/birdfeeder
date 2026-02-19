@@ -2,26 +2,30 @@
 """
 MOTION CAPTURE SCRIPT
 
-PIR-triggered photo capture with sustained motion filtering.
-Captures high-resolution photos when motion is detected for MIN_PULSE_DURATION
-seconds, then uploads to Firebase Storage and logs metadata to Firestore.
+PIR-triggered capture with post-motion duration filtering.
 
-Power optimization: Camera sensor is powered off when idle.
+New capture flow:
+  1. PIR triggers → immediately enter capture mode (no waiting)
+  2. Track how long motion is sustained
+  3. In capture mode, take photos at interval OR record video
+  4. When PIR drops → end capture session
+  5. Post-filter: if motion lasted < threshold → discard entire session
+  6. If long enough → write sidecar .meta.json for batch upload
+
+Power optimization: Camera is powered off when idle.
 """
 
 import os
 import time
 import sys
-import signal
 import json
+import signal
 import traceback
 import threading
 from datetime import datetime
 
-# Import shared configuration
 import shared_config as config
 
-# Hardware library imports
 try:
     from picamera2 import Picamera2
     from gpiozero import MotionSensor
@@ -30,21 +34,33 @@ except ImportError as e:
     print("Install with: pip install picamera2 gpiozero")
     sys.exit(1)
 
-# Setup logging
 logger = config.setup_logging("motion_capture")
 
-# Global state
+# ============================================================================
+# GLOBAL STATE
+# ============================================================================
+
 picam2 = None
 db = None
 storage_bucket = None
-is_capturing = False
-delayed_capture_timer = None
-current_resolution = None  # Track configured resolution to detect changes
 
+# State machine: 'idle' | 'capturing'
+_state = 'idle'
+_state_lock = threading.Lock()
+
+_capture_thread = None
+_motion_start_time = None
+_motion_end_time = None
+_motion_still_active = False  # Updated by PIR callbacks during capture
+
+
+# ============================================================================
+# SETTINGS LOADERS
+# ============================================================================
 
 def load_camera_settings():
     """
-    Load camera controls and resolution from local config file.
+    Load camera resolution and controls from local config file.
     Falls back to shared_config defaults if file is missing or invalid.
 
     Returns:
@@ -58,42 +74,365 @@ def load_camera_settings():
             with open(config.LOCAL_CONFIG_FILE, 'r') as f:
                 settings = json.load(f)
 
-            # Resolution from local config
             res = settings.get("motion_capture_resolution")
             if isinstance(res, (list, tuple)) and len(res) >= 2:
                 resolution = (int(res[0]), int(res[1]))
 
-            # Camera controls from local config (merge over defaults)
             saved_controls = settings.get("camera_controls")
             if isinstance(saved_controls, dict):
                 controls.update(saved_controls)
 
         except Exception as e:
-            logger.warning(f"Could not load local config, using defaults: {e}")
+            logger.warning(f"Could not load camera settings, using defaults: {e}")
 
     return resolution, controls
 
 
-def load_motion_threshold():
+def load_motion_settings():
     """
-    Load motion duration threshold from local config file.
-    Falls back to shared_config default (MIN_PULSE_DURATION) if missing.
+    Load all motion capture settings from local config file.
+    Falls back to shared_config defaults for any missing key.
 
     Returns:
-        float: Seconds of sustained motion required before capturing
+        dict with keys:
+            motion_threshold_seconds  (float) — post-capture discard filter
+            capture_mode              (str)   — 'photo' | 'video'
+            photo_capture_interval    (float) — seconds between photos
+            video_duration_mode       (str)   — 'fixed' | 'motion'
+            video_fixed_duration      (float) — seconds for fixed video
     """
-    threshold = config.MIN_PULSE_DURATION
+    settings = {
+        "motion_threshold_seconds": config.MIN_PULSE_DURATION,
+        "capture_mode": config.DEFAULT_CAPTURE_MODE,
+        "photo_capture_interval": config.DEFAULT_PHOTO_INTERVAL,
+        "video_duration_mode": config.DEFAULT_VIDEO_DURATION_MODE,
+        "video_fixed_duration": config.DEFAULT_VIDEO_FIXED_DURATION,
+    }
+
     if os.path.exists(config.LOCAL_CONFIG_FILE):
         try:
             with open(config.LOCAL_CONFIG_FILE, 'r') as f:
-                settings = json.load(f)
-            val = settings.get("motion_threshold_seconds")
-            if isinstance(val, (int, float)) and val >= 1.0:
-                threshold = float(val)
-        except Exception as e:
-            logger.warning(f"Could not load motion threshold, using default: {e}")
-    return threshold
+                local = json.load(f)
 
+            threshold = local.get("motion_threshold_seconds")
+            if isinstance(threshold, (int, float)) and threshold >= 1.0:
+                settings["motion_threshold_seconds"] = float(threshold)
+
+            capture_mode = local.get("capture_mode")
+            if capture_mode in ('photo', 'video'):
+                settings["capture_mode"] = capture_mode
+
+            photo_interval = local.get("photo_capture_interval")
+            if isinstance(photo_interval, (int, float)) and photo_interval >= 0.5:
+                settings["photo_capture_interval"] = float(photo_interval)
+
+            video_duration_mode = local.get("video_duration_mode")
+            if video_duration_mode in ('fixed', 'motion'):
+                settings["video_duration_mode"] = video_duration_mode
+
+            video_fixed_duration = local.get("video_fixed_duration")
+            if isinstance(video_fixed_duration, (int, float)) and video_fixed_duration >= 1.0:
+                settings["video_fixed_duration"] = float(video_fixed_duration)
+
+        except Exception as e:
+            logger.warning(f"Could not load motion settings, using defaults: {e}")
+
+    return settings
+
+
+# ============================================================================
+# CAMERA CONFIGURATION
+# ============================================================================
+
+def _reconfigure_camera(resolution, capture_mode):
+    """
+    Configure picam2 for the correct mode.
+    Must be called before picam2.start() each session since mode may change.
+    """
+    global picam2
+
+    if capture_mode == 'video':
+        cam_config = picam2.create_video_configuration(
+            main={"size": resolution}
+        )
+        logger.info(f"Camera configured for video at {resolution}")
+    else:
+        cam_config = picam2.create_still_configuration(
+            main={"size": resolution}
+        )
+        logger.info(f"Camera configured for still capture at {resolution}")
+
+    picam2.configure(cam_config)
+
+
+# ============================================================================
+# CAPTURE WORKERS
+# ============================================================================
+
+def _run_photo_loop(motion_settings, instance_id):
+    """
+    Take photos at photo_capture_interval while PIR is active.
+
+    Returns:
+        list[str]: Local filepaths of captured photos
+    """
+    interval = motion_settings["photo_capture_interval"]
+    files = []
+    photo_index = 0
+
+    while _motion_still_active:
+        filename = f"{instance_id}_p{photo_index:02d}.jpg"
+        filepath = os.path.join(config.UPLOAD_QUEUE_DIR, filename)
+
+        picam2.capture_file(filepath)
+        files.append(filepath)
+        logger.info(f"Photo {photo_index + 1}: {filename}")
+        photo_index += 1
+
+        # Wait for interval, but check PIR state every 0.5s so we exit promptly
+        elapsed = 0.0
+        while _motion_still_active and elapsed < interval:
+            time.sleep(0.5)
+            elapsed += 0.5
+
+    return files
+
+
+def _run_video_capture(motion_settings, instance_id):
+    """
+    Record a single video file.
+
+    video_duration_mode == 'fixed': record for video_fixed_duration seconds
+    video_duration_mode == 'motion': record until PIR drops
+
+    Returns:
+        list[str]: List with one filepath, or empty list on failure
+    """
+    try:
+        from picamera2.encoders import H264Encoder
+        from picamera2.outputs import FileOutput
+    except ImportError:
+        logger.error("H264Encoder not available — cannot record video")
+        return []
+
+    duration_mode = motion_settings["video_duration_mode"]
+    fixed_duration = motion_settings["video_fixed_duration"]
+
+    filename = f"{instance_id}_v00.h264"
+    filepath = os.path.join(config.UPLOAD_QUEUE_DIR, filename)
+
+    encoder = H264Encoder()
+    try:
+        picam2.start_recording(encoder, filepath)
+        logger.info(f"Video recording started: {filename}")
+
+        if duration_mode == 'fixed':
+            time.sleep(fixed_duration)
+        else:
+            # Poll PIR state; exit when motion ends
+            while _motion_still_active:
+                time.sleep(0.25)
+
+        picam2.stop_recording()
+        logger.info(f"Video recording complete: {filename}")
+        return [filepath]
+
+    except Exception as e:
+        logger.error(f"Video recording failed: {e}")
+        traceback.print_exc()
+        try:
+            picam2.stop_recording()
+        except Exception:
+            pass
+        return []
+
+
+# ============================================================================
+# INSTANCE MANAGEMENT
+# ============================================================================
+
+def _write_instance_metadata(instance_id, session_timestamp, motion_duration,
+                              capture_mode, captured_files):
+    """
+    Write a sidecar .meta.json file to upload_queue/ that groups the files
+    from this motion instance. system_updater reads these to create
+    grouped Firestore documents.
+
+    Args:
+        instance_id:       str   — "inst_YYYYMMDD_HHMMSS"
+        session_timestamp: datetime — start of motion
+        motion_duration:   float — seconds PIR was active
+        capture_mode:      str   — 'photo' | 'video'
+        captured_files:    list  — local filepaths captured this session
+    """
+    meta_filename = f"{instance_id}{config.INSTANCE_METADATA_SUFFIX}"
+    meta_filepath = os.path.join(config.UPLOAD_QUEUE_DIR, meta_filename)
+
+    file_basenames = [os.path.basename(f) for f in captured_files]
+
+    metadata = {
+        "instance_id": instance_id,
+        "timestamp": session_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        "motion_duration": round(motion_duration, 2),
+        "capture_mode": capture_mode,
+        "files": file_basenames,
+    }
+
+    with open(meta_filepath, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info(f"Instance metadata written: {meta_filename}")
+
+
+def _discard_files(filepaths):
+    """Delete captured files from a session that was too short to keep."""
+    for fp in filepaths:
+        try:
+            os.remove(fp)
+            logger.info(f"Discarded: {os.path.basename(fp)}")
+        except Exception as e:
+            logger.warning(f"Could not discard {fp}: {e}")
+
+
+# ============================================================================
+# CAPTURE SESSION WORKER
+# ============================================================================
+
+def _capture_session_worker():
+    """
+    Runs in a background thread during a capture session.
+
+    Lifecycle:
+      1. Load all settings
+      2. Configure and start camera
+      3. Run photo loop or video recording while PIR is active
+      4. After PIR drops: compute motion duration
+      5. If duration < threshold: discard all files
+      6. Else: write sidecar metadata for batch upload
+      7. Stop camera, reset state to 'idle'
+    """
+    global _state, _motion_end_time
+
+    motion_settings = load_motion_settings()
+    camera_resolution, camera_controls = load_camera_settings()
+
+    capture_mode = motion_settings["capture_mode"]
+    threshold = motion_settings["motion_threshold_seconds"]
+
+    session_timestamp = datetime.now()
+    session_start = time.monotonic()
+    instance_id = "inst_" + session_timestamp.strftime("%Y%m%d_%H%M%S")
+
+    captured_files = []
+
+    try:
+        _reconfigure_camera(camera_resolution, capture_mode)
+        picam2.start()
+
+        try:
+            picam2.set_controls(camera_controls)
+        except Exception as e:
+            logger.warning(f"Some camera controls failed: {e}")
+
+        logger.info(f"Camera started, warming up {config.CAMERA_WARMUP_TIME}s")
+        time.sleep(config.CAMERA_WARMUP_TIME)
+
+        if capture_mode == 'photo':
+            captured_files = _run_photo_loop(motion_settings, instance_id)
+        else:
+            captured_files = _run_video_capture(motion_settings, instance_id)
+
+    except Exception as e:
+        logger.error(f"Capture session error: {e}")
+        traceback.print_exc()
+
+    finally:
+        try:
+            picam2.stop()
+            logger.info("Camera stopped")
+        except Exception as e:
+            logger.warning(f"Could not stop camera: {e}")
+
+    # Determine actual motion duration
+    end_time = _motion_end_time if _motion_end_time is not None else time.monotonic()
+    motion_duration = end_time - session_start
+
+    logger.info(f"Motion duration: {motion_duration:.1f}s (threshold: {threshold}s)")
+
+    if motion_duration < threshold:
+        logger.info(
+            f"Duration below threshold — discarding {len(captured_files)} file(s)"
+        )
+        _discard_files(captured_files)
+    elif captured_files:
+        logger.info(
+            f"Queuing {len(captured_files)} file(s) for batch upload"
+        )
+        try:
+            _write_instance_metadata(
+                instance_id=instance_id,
+                session_timestamp=session_timestamp,
+                motion_duration=motion_duration,
+                capture_mode=capture_mode,
+                captured_files=captured_files,
+            )
+        except Exception as e:
+            logger.error(f"Could not write instance metadata: {e}")
+    else:
+        logger.warning("No files captured this session")
+
+    with _state_lock:
+        _state = 'idle'
+
+    logger.info("=== Capture session complete — idle ===\n")
+
+
+# ============================================================================
+# PIR SENSOR CALLBACKS
+# ============================================================================
+
+def motion_started():
+    """
+    PIR went high — begin capture immediately if not already capturing.
+    If already in a session (re-trigger during interval wait), just ensure
+    _motion_still_active stays True so the photo loop continues.
+    """
+    global _state, _capture_thread, _motion_start_time, _motion_end_time
+    global _motion_still_active
+
+    _motion_still_active = True
+    _motion_end_time = None  # Reset end time on re-trigger
+
+    with _state_lock:
+        if _state == 'capturing':
+            logger.debug("PIR re-triggered during active session")
+            return
+
+        _state = 'capturing'
+
+    _motion_start_time = time.monotonic()
+    logger.info("=== MOTION DETECTED — CAPTURE SESSION STARTED ===")
+
+    _capture_thread = threading.Thread(
+        target=_capture_session_worker,
+        daemon=True,
+        name="capture_worker"
+    )
+    _capture_thread.start()
+
+
+def motion_ended():
+    """PIR went low — signal worker thread to wrap up."""
+    global _motion_still_active, _motion_end_time
+
+    _motion_still_active = False
+    _motion_end_time = time.monotonic()
+    logger.info("PIR dropped — motion ended")
+
+
+# ============================================================================
+# FIREBASE + CAMERA INIT
+# ============================================================================
 
 def init_firebase():
     """Initialize Firebase Admin SDK."""
@@ -113,207 +452,45 @@ def init_firebase():
 
 
 def init_camera():
-    """Configure Picamera2 with settings from local config (does not start sensor)."""
-    global picam2, current_resolution
+    """
+    Verify camera hardware is available.
+    Actual configuration is deferred to each capture session
+    (since mode may differ between photo/video).
+    """
+    global picam2
     try:
-        resolution, _ = load_camera_settings()
         picam2 = Picamera2()
-        camera_config = picam2.create_still_configuration(
-            main={"size": resolution}
-        )
-        picam2.configure(camera_config)
-        current_resolution = resolution
-        logger.info(f"Camera configured at {resolution}")
+        logger.info("Camera hardware verified")
         return True
     except Exception as e:
-        logger.error(f"Camera initialization failed: {e}")
+        logger.error(f"Camera not available: {e}")
         traceback.print_exc()
         return False
 
 
-def upload_photo(filepath, filename, timestamp):
-    """
-    Upload photo to Firebase Storage and log metadata to Firestore.
-
-    Args:
-        filepath: Local path to photo file
-        filename: Name for the uploaded file
-        timestamp: Timestamp string for metadata
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    if not db or not storage_bucket:
-        logger.warning("Skipping upload - Firebase not initialized")
-        return False
-
-    try:
-        # Get file size
-        file_size = os.path.getsize(filepath)
-        logger.info(f"Uploading {filename} ({file_size / 1024 / 1024:.2f} MB)")
-
-        # Upload to Storage
-        storage_path = f"{config.SIGHTINGS_STORAGE_PATH}/{filename}"
-        blob = storage_bucket.blob(storage_path)
-        blob.upload_from_filename(filepath)
-        blob.make_public()
-        image_url = blob.public_url
-        logger.info(f"Uploaded to {storage_path}")
-
-        # Log metadata to Firestore
-        db.collection("logs").document("motion_captures").collection("data").add({
-            "imageUrl": image_url,
-            "resolution": f"{current_resolution[0]}x{current_resolution[1]}",
-            "sizeBytes": file_size,
-            "storagePath": storage_path,
-            "timestamp": timestamp,
-            "isIdentified": False,
-            "catalogBirdId": "",
-            "speciesName": "",
-        })
-        logger.info("Metadata logged to Firestore")
-
-        # Clean up local file
-        os.remove(filepath)
-        logger.info("Local file cleaned up")
-        return True
-
-    except Exception as e:
-        logger.error(f"Upload failed: {e}")
-        traceback.print_exc()
-        # Move failed file back to queue for later retry
-        try:
-            os.rename(filepath, os.path.join(config.UPLOAD_QUEUE_DIR, filename))
-            logger.info("File moved to upload queue for retry")
-        except Exception:
-            pass
-        return False
-
-
-def capture_sequence():
-    """
-    Execute photo capture, upload, and logging sequence.
-    Called by timer thread after MIN_PULSE_DURATION seconds of sustained motion.
-    """
-    global is_capturing, delayed_capture_timer, current_resolution
-
-    if is_capturing:
-        logger.warning("Timer expired but camera busy - skipping capture")
-        return
-
-    is_capturing = True
-    logger.info("=== SUSTAINED MOTION CONFIRMED - CAPTURING ===")
-
-    try:
-        # Reload settings (may have changed via app since last capture)
-        resolution, controls = load_camera_settings()
-
-        # Reconfigure camera if resolution changed
-        if current_resolution is None or resolution != current_resolution:
-            if current_resolution is not None:
-                logger.info(f"Resolution changed: {current_resolution} -> {resolution}")
-            camera_config = picam2.create_still_configuration(
-                main={"size": resolution}
-            )
-            picam2.configure(camera_config)
-            current_resolution = resolution
-
-        # Start camera sensor
-        picam2.start()
-
-        # Apply camera controls
-        try:
-            picam2.set_controls(controls)
-            logger.info(f"Camera controls applied: {controls}")
-        except Exception as e:
-            logger.warning(f"Some camera controls failed to apply: {e}")
-
-        logger.info(f"Camera started, warming up for {config.CAMERA_WARMUP_TIME}s")
-        time.sleep(config.CAMERA_WARMUP_TIME)
-
-        # Generate filename and path
-        filename = config.get_timestamp_filename(prefix="bird", extension="jpg")
-        filepath = os.path.join(config.UPLOAD_QUEUE_DIR, filename)
-
-        # Capture photo
-        picam2.capture_file(filepath)
-        logger.info(f"Photo captured: {filepath}")
-
-        # File stays in upload queue — batch upload happens when app opens
-        logger.info(f"Photo queued for batch upload: {filename}")
-
-    except Exception as e:
-        logger.error(f"Capture sequence failed: {e}")
-        traceback.print_exc()
-
-    finally:
-        # Stop camera sensor (power saving)
-        try:
-            picam2.stop()
-            logger.info("Camera stopped")
-        except Exception as e:
-            logger.warning(f"Could not stop camera: {e}")
-
-        is_capturing = False
-        logger.info("=== Capture complete, waiting for motion ===\n")
-
-
-def motion_started():
-    """
-    PIR motion detected - start timer for sustained motion check.
-    Called by gpiozero when motion sensor triggers.
-    """
-    global delayed_capture_timer, is_capturing
-
-    if is_capturing:
-        logger.debug("Motion detected but capture in progress - ignoring")
-        return
-
-    # Read current threshold from config (allows live updates from app)
-    threshold = load_motion_threshold()
-
-    # Cancel existing timer if motion re-detected
-    if delayed_capture_timer and delayed_capture_timer.is_alive():
-        delayed_capture_timer.cancel()
-        logger.info(f"Motion re-detected, restarting {threshold}s timer")
-
-    # Start new timer
-    delayed_capture_timer = threading.Timer(threshold, capture_sequence)
-    delayed_capture_timer.daemon = True
-    delayed_capture_timer.start()
-
-    logger.info(f"Motion detected - {threshold}s timer started")
-
-
-def motion_ended():
-    """
-    PIR motion stopped - cancel timer if motion was too brief.
-    Called by gpiozero when motion sensor deactivates.
-    """
-    global delayed_capture_timer
-
-    if delayed_capture_timer and delayed_capture_timer.is_alive():
-        delayed_capture_timer.cancel()
-        logger.info("Motion stopped early - timer cancelled (false positive filtered)")
-
-    delayed_capture_timer = None
-
+# ============================================================================
+# CLEANUP AND SIGNAL HANDLING
+# ============================================================================
 
 def cleanup():
     """Clean up resources on shutdown."""
-    global delayed_capture_timer, picam2
+    global _capture_thread, picam2
 
     logger.info("Shutting down...")
 
-    # Cancel any pending timer
-    if delayed_capture_timer and delayed_capture_timer.is_alive():
-        delayed_capture_timer.cancel()
+    # Signal any active capture session to stop
+    global _motion_still_active
+    _motion_still_active = False
+
+    # Wait briefly for the worker thread to finish
+    if _capture_thread and _capture_thread.is_alive():
+        logger.info("Waiting for capture session to finish...")
+        _capture_thread.join(timeout=5.0)
 
     # Stop camera if running
     if picam2:
         try:
-            if picam2.started:
-                picam2.stop()
+            picam2.stop()
         except Exception:
             pass
 
@@ -326,37 +503,36 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
+# ============================================================================
+# MAIN
+# ============================================================================
+
 if __name__ == "__main__":
-    # Setup signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        # Ensure upload queue directory exists
         config.ensure_directory_exists(config.UPLOAD_QUEUE_DIR)
 
-        # Initialize Firebase
         if not init_firebase():
             logger.error("Exiting due to Firebase initialization failure")
             sys.exit(1)
 
-        # Initialize camera
         if not init_camera():
             logger.error("Exiting due to camera initialization failure")
             sys.exit(1)
 
-        # Initialize PIR motion sensor
         pir = MotionSensor(config.MOTION_PIN, threshold=config.DEBOUNCE_DELAY)
         pir.when_motion = motion_started
         pir.when_no_motion = motion_ended
 
-        initial_threshold = load_motion_threshold()
+        initial_settings = load_motion_settings()
         logger.info(f"Motion detection active on GPIO pin {config.MOTION_PIN}")
-        logger.info(f"Sustained motion filter: {initial_threshold}s (configurable via app)")
-        logger.info("Camera is OFF (low-power mode). Press CTRL+C to exit")
+        logger.info(f"Duration filter threshold: {initial_settings['motion_threshold_seconds']}s")
+        logger.info(f"Capture mode: {initial_settings['capture_mode']}")
+        logger.info("Camera is OFF (low-power mode). Waiting for motion...")
         logger.info("-" * 60)
 
-        # Keep script running and wait for motion events
         signal.pause()
 
     except Exception as e:

@@ -66,6 +66,11 @@ def load_local_config() -> Dict[str, Any]:
         "motion_capture_resolution": list(config.DEFAULT_CAPTURE_RESOLUTION),
         "stream_framerate": config.DEFAULT_FRAMERATE,
         "motion_capture_enabled": False,
+        "motion_threshold_seconds": config.MIN_PULSE_DURATION,
+        "capture_mode": config.DEFAULT_CAPTURE_MODE,
+        "photo_capture_interval": config.DEFAULT_PHOTO_INTERVAL,
+        "video_duration_mode": config.DEFAULT_VIDEO_DURATION_MODE,
+        "video_fixed_duration": config.DEFAULT_VIDEO_FIXED_DURATION,
         "camera_controls": dict(config.DEFAULT_CAMERA_CONTROLS),
     }
 
@@ -148,6 +153,36 @@ def normalize_settings(doc_dict: Dict[str, Any]) -> Dict[str, Any]:
             val = float(motion_thresh)
             if 1.0 <= val <= 20.0:
                 out["motion_threshold_seconds"] = val
+        except (TypeError, ValueError):
+            pass
+
+    # Capture mode: 'photo' | 'video'
+    capture_mode = doc_dict.get("capture_mode")
+    if capture_mode in ('photo', 'video'):
+        out["capture_mode"] = capture_mode
+
+    # Photo capture interval (seconds between photos)
+    photo_interval = doc_dict.get("photo_capture_interval")
+    if photo_interval is not None:
+        try:
+            val = float(photo_interval)
+            if 0.5 <= val <= 60.0:
+                out["photo_capture_interval"] = val
+        except (TypeError, ValueError):
+            pass
+
+    # Video duration mode: 'fixed' | 'motion'
+    video_duration_mode = doc_dict.get("video_duration_mode")
+    if video_duration_mode in ('fixed', 'motion'):
+        out["video_duration_mode"] = video_duration_mode
+
+    # Video fixed duration (seconds)
+    video_fixed_duration = doc_dict.get("video_fixed_duration")
+    if video_fixed_duration is not None:
+        try:
+            val = float(video_fixed_duration)
+            if 1.0 <= val <= 120.0:
+                out["video_fixed_duration"] = val
         except (TypeError, ValueError):
             pass
 
@@ -261,54 +296,131 @@ def run_uploader() -> None:
         logger.error(f"Energy data upload exception: {e}")
 
 
-def batch_upload_queue() -> None:
+def _upload_instance(meta: Dict[str, Any]) -> bool:
     """
-    Upload all queued motion capture photos to Firebase Storage and Firestore.
+    Upload all files for one motion capture instance and write a single
+    grouped Firestore document.
 
-    Iterates the local upload queue directory for 'bird_*.jpg' files,
-    uploads each to Storage, logs metadata to Firestore, and deletes the
-    local file on success. Called on app open and on manual refresh request.
+    Args:
+        meta: Parsed .meta.json dict with keys:
+              instance_id, timestamp, motion_duration, capture_mode, files
+
+    Returns:
+        True if all files uploaded and Firestore write succeeded.
     """
-    if not db or not storage_bucket:
-        logger.warning("Batch upload skipped - Firebase not initialized")
-        return
+    instance_id = meta.get("instance_id", "unknown")
+    timestamp_str = meta.get("timestamp", config.get_timestamp_string())
+    motion_duration = float(meta.get("motion_duration", 0.0))
+    capture_mode = meta.get("capture_mode", "photo")
+    file_basenames = meta.get("files", [])
 
-    if not os.path.exists(config.UPLOAD_QUEUE_DIR):
-        logger.info("Upload queue directory does not exist - nothing to upload")
-        return
+    if not file_basenames:
+        logger.warning(f"Instance {instance_id}: no files listed — skipping")
+        return True  # No files, but sidecar can be removed
 
-    queue_files = sorted([
-        f for f in os.listdir(config.UPLOAD_QUEUE_DIR)
-        if f.endswith('.jpg') and f.startswith('bird_')
-    ])
-
-    if not queue_files:
-        logger.info("Upload queue is empty - no motion captures to upload")
-        return
-
-    logger.info(f"=== BATCH UPLOAD: {len(queue_files)} file(s) in queue ===")
-
-    # Read current resolution from local config for metadata
     local_cfg = load_local_config()
     mc_res = local_cfg.get("motion_capture_resolution", [4608, 2592])
     resolution_str = f"{mc_res[0]}x{mc_res[1]}"
 
-    success_count = 0
-    fail_count = 0
+    storage_paths = []
+    image_urls = []
+    uploaded_local_paths = []
 
-    for filename in queue_files:
+    for basename in file_basenames:
+        local_path = os.path.join(config.UPLOAD_QUEUE_DIR, basename)
+        if not os.path.exists(local_path):
+            logger.warning(f"  File missing: {basename} — skipping")
+            continue
+
+        storage_path = f"{config.SIGHTINGS_STORAGE_PATH}/{basename}"
+        try:
+            blob = storage_bucket.blob(storage_path)
+            blob.upload_from_filename(local_path)
+            blob.make_public()
+            image_url = blob.public_url
+
+            storage_paths.append(storage_path)
+            image_urls.append(image_url)
+            uploaded_local_paths.append(local_path)
+            logger.info(f"  Uploaded: {basename}")
+
+        except Exception as e:
+            logger.error(f"  Failed to upload {basename}: {e}")
+            traceback.print_exc()
+            return False  # Partial upload — leave in queue for retry
+
+    if not storage_paths:
+        logger.error(f"Instance {instance_id}: all file uploads failed")
+        return False
+
+    # Write ONE Firestore doc using instance_id as document ID (idempotent)
+    try:
+        doc_ref = (
+            db.collection("logs")
+            .document("motion_captures")
+            .collection("data")
+            .document(instance_id)
+        )
+        doc_ref.set({
+            "timestamp": timestamp_str,
+            "motion_duration": motion_duration,
+            "capture_mode": capture_mode,
+            "file_count": len(storage_paths),
+            "storage_paths": storage_paths,
+            "image_urls": image_urls,
+            "resolution": resolution_str,
+            "is_identified": False,
+            "species_name": "",
+            "catalog_bird_id": "",
+            "source_type": "motion_capture",
+        })
+        logger.info(f"Firestore doc written: {instance_id}")
+
+    except Exception as e:
+        logger.error(f"Firestore write failed for {instance_id}: {e}")
+        traceback.print_exc()
+        return False
+
+    # Delete local files only after confirmed Firestore write
+    for local_path in uploaded_local_paths:
+        try:
+            os.remove(local_path)
+        except Exception as e:
+            logger.warning(f"Could not delete {os.path.basename(local_path)}: {e}")
+
+    return True
+
+
+def _upload_legacy_queue(queue_contents: list) -> None:
+    """
+    Handle legacy bird_*.jpg files from the old motion_capture.py (no sidecar).
+    Creates a single-image Firestore doc per file matching the old schema.
+    This can be removed once pre-upgrade queued files are cleared.
+    """
+    legacy_files = sorted([
+        f for f in queue_contents
+        if f.endswith('.jpg') and f.startswith('bird_')
+    ])
+
+    if not legacy_files:
+        return
+
+    logger.info(f"Legacy queue: {len(legacy_files)} old-format file(s)")
+
+    local_cfg = load_local_config()
+    mc_res = local_cfg.get("motion_capture_resolution", [4608, 2592])
+    resolution_str = f"{mc_res[0]}x{mc_res[1]}"
+
+    for filename in legacy_files:
         filepath = os.path.join(config.UPLOAD_QUEUE_DIR, filename)
         try:
             file_size = os.path.getsize(filepath)
-
-            # Upload to Firebase Storage
             storage_path = f"{config.SIGHTINGS_STORAGE_PATH}/{filename}"
             blob = storage_bucket.blob(storage_path)
             blob.upload_from_filename(filepath)
             blob.make_public()
             image_url = blob.public_url
 
-            # Parse timestamp from filename: bird_YYYYMMDD_HHMMSS.jpg
             try:
                 parts = filename.replace('.jpg', '').split('_')
                 if len(parts) >= 3:
@@ -319,7 +431,6 @@ def batch_upload_queue() -> None:
             except Exception:
                 ts_str = config.get_timestamp_string()
 
-            # Log metadata to Firestore
             db.collection("logs").document("motion_captures").collection("data").add({
                 "imageUrl": image_url,
                 "resolution": resolution_str,
@@ -329,18 +440,76 @@ def batch_upload_queue() -> None:
                 "isIdentified": False,
                 "catalogBirdId": "",
                 "speciesName": "",
+                "source_type": "motion_capture_legacy",
             })
 
             os.remove(filepath)
-            success_count += 1
-            logger.info(f"Uploaded: {filename}")
+            logger.info(f"Legacy upload: {filename}")
 
         except Exception as e:
-            fail_count += 1
-            logger.error(f"Failed to upload {filename}: {e}")
+            logger.error(f"Failed legacy upload {filename}: {e}")
             traceback.print_exc()
 
-    logger.info(f"=== BATCH UPLOAD DONE: {success_count} uploaded, {fail_count} failed ===")
+
+def batch_upload_queue() -> None:
+    """
+    Upload all queued motion capture instances to Firebase Storage and Firestore.
+
+    New instance-based flow:
+      1. Find all .meta.json sidecar files in upload_queue/
+      2. For each instance: upload all referenced files, write one Firestore doc
+      3. Delete sidecar on success; leave on failure (retry on next open)
+      4. Fall back to legacy bird_*.jpg handling for pre-upgrade files
+    """
+    if not db or not storage_bucket:
+        logger.warning("Batch upload skipped - Firebase not initialized")
+        return
+
+    if not os.path.exists(config.UPLOAD_QUEUE_DIR):
+        logger.info("Upload queue directory does not exist - nothing to upload")
+        return
+
+    queue_contents = os.listdir(config.UPLOAD_QUEUE_DIR)
+
+    # Find all instance sidecar files
+    meta_files = sorted([
+        f for f in queue_contents
+        if f.endswith(config.INSTANCE_METADATA_SUFFIX)
+    ])
+
+    if not meta_files:
+        logger.info("Upload queue: no pending motion instances")
+        _upload_legacy_queue(queue_contents)
+        return
+
+    logger.info(f"=== BATCH UPLOAD: {len(meta_files)} instance(s) ===")
+    success_count = 0
+    fail_count = 0
+
+    for meta_filename in meta_files:
+        meta_path = os.path.join(config.UPLOAD_QUEUE_DIR, meta_filename)
+        try:
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+        except Exception as e:
+            logger.error(f"Could not read metadata {meta_filename}: {e}")
+            fail_count += 1
+            continue
+
+        success = _upload_instance(meta)
+        if success:
+            try:
+                os.remove(meta_path)
+            except Exception as e:
+                logger.warning(f"Could not delete sidecar {meta_filename}: {e}")
+            success_count += 1
+        else:
+            fail_count += 1
+
+    logger.info(f"=== BATCH UPLOAD DONE: {success_count} succeeded, {fail_count} failed ===")
+
+    # Also handle any remaining legacy files
+    _upload_legacy_queue(os.listdir(config.UPLOAD_QUEUE_DIR))
 
 
 def on_batch_upload_snapshot(doc_snapshot, changes, read_time) -> None:

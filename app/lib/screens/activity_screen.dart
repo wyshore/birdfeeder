@@ -4,12 +4,13 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import '../models/sighting.dart';
+import '../models/motion_instance.dart';
 import '../models/bird.dart';
 import '../config/firebase_paths.dart';
 import '../utils/string_extensions.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Activity Screen — shows all unidentified sightings, grouped by day
+// Activity Screen — shows unidentified motion instances + snapshots, by day
 // ─────────────────────────────────────────────────────────────────────────────
 
 class ActivityScreen extends StatefulWidget {
@@ -20,13 +21,11 @@ class ActivityScreen extends StatefulWidget {
 }
 
 class _ActivityScreenState extends State<ActivityScreen> {
-  // Selection state
   final Set<String> _selectedIds = {};
   bool _isSelectionMode = false;
   bool _isRefreshing = false;
 
-  // Merged stream from both collections
-  late final Stream<List<_TaggedSighting>> _unidentifiedStream;
+  late final Stream<List<_ActivityItem>> _unidentifiedStream;
 
   @override
   void initState() {
@@ -34,19 +33,36 @@ class _ActivityScreenState extends State<ActivityScreen> {
     _unidentifiedStream = _buildMergedStream();
   }
 
-  Stream<List<_TaggedSighting>> _buildMergedStream() {
+  Stream<List<_ActivityItem>> _buildMergedStream() {
     final firestore = FirebaseFirestore.instance;
 
-    final motionStream = firestore
+    // New motion instances — Pi v2 writes snake_case (is_identified)
+    final instanceStream = firestore
+        .collection(LogPaths.motionCaptures)
+        .where('is_identified', isEqualTo: false)
+        .orderBy('timestamp', descending: true)
+        .limit(100)
+        .snapshots()
+        .map((s) => s.docs
+            .map((d) => _InstanceItem(MotionInstance.fromFirestore(d)))
+            .toList() as List<_ActivityItem>);
+
+    // Legacy motion captures — old format uses camelCase (isIdentified)
+    final legacyMotionStream = firestore
         .collection(LogPaths.motionCaptures)
         .where('isIdentified', isEqualTo: false)
         .orderBy('timestamp', descending: true)
         .limit(100)
         .snapshots()
         .map((s) => s.docs
-            .map((d) => _TaggedSighting(Sighting.fromFirestore(d), 'motion_capture', LogPaths.motionCaptures))
-            .toList());
+            .map((d) => _SnapshotItem(
+                  Sighting.fromFirestore(d),
+                  collectionPath: LogPaths.motionCaptures,
+                  tileLabel: 'Old Capture',
+                ))
+            .toList() as List<_ActivityItem>);
 
+    // Manual snapshots — camera_server writes camelCase (isIdentified)
     final snapshotStream = firestore
         .collection(LogPaths.snapshots)
         .where('isIdentified', isEqualTo: false)
@@ -54,41 +70,39 @@ class _ActivityScreenState extends State<ActivityScreen> {
         .limit(50)
         .snapshots()
         .map((s) => s.docs
-            .map((d) => _TaggedSighting(Sighting.fromFirestore(d), 'snapshot', LogPaths.snapshots))
-            .toList());
+            .map((d) => _SnapshotItem(Sighting.fromFirestore(d)))
+            .toList() as List<_ActivityItem>);
 
-    // Merge the two streams by combining latest values
-    return _combineLatest(motionStream, snapshotStream);
+    return _combineAll([instanceStream, legacyMotionStream, snapshotStream]);
   }
 
-  Stream<List<_TaggedSighting>> _combineLatest(
-    Stream<List<_TaggedSighting>> a,
-    Stream<List<_TaggedSighting>> b,
+  Stream<List<_ActivityItem>> _combineAll(
+    List<Stream<List<_ActivityItem>>> streams,
   ) {
-    final controller = StreamController<List<_TaggedSighting>>();
-    List<_TaggedSighting>? latestA;
-    List<_TaggedSighting>? latestB;
+    final controller = StreamController<List<_ActivityItem>>();
+    final latest = List<List<_ActivityItem>?>.filled(streams.length, null);
+    final subs = <StreamSubscription<List<_ActivityItem>>>[];
 
     void emit() {
-      if (latestA != null && latestB != null) {
-        final combined = [...latestA!, ...latestB!];
-        combined.sort((x, y) => y.sighting.timestamp.compareTo(x.sighting.timestamp));
+      if (latest.every((l) => l != null)) {
+        final combined = latest.expand((l) => l!).toList();
+        combined.sort((x, y) => y.timestamp.compareTo(x.timestamp));
         controller.add(combined);
       }
     }
 
-    final subA = a.listen((data) { latestA = data; emit(); }, onError: controller.addError);
-    final subB = b.listen((data) { latestB = data; emit(); }, onError: controller.addError);
-
-    controller.onCancel = () {
-      subA.cancel();
-      subB.cancel();
-    };
-
+    for (var i = 0; i < streams.length; i++) {
+      final idx = i;
+      subs.add(streams[idx].listen(
+        (data) { latest[idx] = data; emit(); },
+        onError: controller.addError,
+      ));
+    }
+    controller.onCancel = () { for (final s in subs) { s.cancel(); } };
     return controller.stream;
   }
 
-  // ── Selection helpers ──────────────────────────────────────────────────────
+  // ── Selection ──────────────────────────────────────────────────────────────
 
   void _toggleSelectionMode(bool value) {
     setState(() {
@@ -110,8 +124,8 @@ class _ActivityScreenState extends State<ActivityScreen> {
 
   // ── Delete selected ────────────────────────────────────────────────────────
 
-  Future<void> _deleteSelected(List<_TaggedSighting> allSightings) async {
-    final toDelete = allSightings.where((s) => _selectedIds.contains(s.sighting.id)).toList();
+  Future<void> _deleteSelected(List<_ActivityItem> allItems) async {
+    final toDelete = allItems.where((i) => _selectedIds.contains(i.id)).toList();
     if (toDelete.isEmpty) return;
 
     setState(() {
@@ -121,21 +135,27 @@ class _ActivityScreenState extends State<ActivityScreen> {
 
     final firestore = FirebaseFirestore.instance;
     final storage = FirebaseStorage.instance;
-    final batch = firestore.batch();
 
     try {
-      for (final tagged in toDelete) {
-        final docRef = firestore.collection(tagged.collectionPath).doc(tagged.sighting.id);
-        batch.delete(docRef);
-        final path = tagged.sighting.storagePath;
-        if (path.isNotEmpty) {
-          try { await storage.ref(path).delete(); } catch (_) {}
+      for (final item in toDelete) {
+        if (item is _InstanceItem) {
+          for (final path in item.instance.storagePaths) {
+            if (path.isNotEmpty) {
+              try { await storage.ref(path).delete(); } catch (_) {}
+            }
+          }
+          await firestore.collection(LogPaths.motionCaptures).doc(item.id).delete();
+        } else if (item is _SnapshotItem) {
+          final path = item.sighting.storagePath;
+          if (path.isNotEmpty) {
+            try { await storage.ref(path).delete(); } catch (_) {}
+          }
+          await firestore.collection(item.collectionPath).doc(item.id).delete();
         }
       }
-      await batch.commit();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Deleted ${toDelete.length} sighting(s).')),
+          SnackBar(content: Text('Deleted ${toDelete.length} item(s).')),
         );
       }
     } catch (e) {
@@ -147,18 +167,18 @@ class _ActivityScreenState extends State<ActivityScreen> {
     }
   }
 
-  // ── Clear all sightings for a day ─────────────────────────────────────────
+  // ── Clear all items for a day ──────────────────────────────────────────────
 
   Future<void> _clearDay(_DayGroup group) async {
-    final count = group.sightings.length;
+    final count = group.items.length;
     final dayLabel = _formatDayHeader(group.dateKey);
     final confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text('Clear $dayLabel?'),
         content: Text(
-          'This will permanently delete all $count photo${count != 1 ? 's' : ''} from $dayLabel, '
-          'including their images in storage. This cannot be undone.',
+          'This will permanently delete $count item${count != 1 ? 's' : ''} from $dayLabel, '
+          'including all images. This cannot be undone.',
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
@@ -174,20 +194,27 @@ class _ActivityScreenState extends State<ActivityScreen> {
 
     final firestore = FirebaseFirestore.instance;
     final storage = FirebaseStorage.instance;
-    final batch = firestore.batch();
 
     try {
-      for (final tagged in group.sightings) {
-        batch.delete(firestore.collection(tagged.collectionPath).doc(tagged.sighting.id));
-        final path = tagged.sighting.storagePath;
-        if (path.isNotEmpty) {
-          try { await storage.ref(path).delete(); } catch (_) {}
+      for (final item in group.items) {
+        if (item is _InstanceItem) {
+          for (final path in item.instance.storagePaths) {
+            if (path.isNotEmpty) {
+              try { await storage.ref(path).delete(); } catch (_) {}
+            }
+          }
+          await firestore.collection(LogPaths.motionCaptures).doc(item.id).delete();
+        } else if (item is _SnapshotItem) {
+          final path = item.sighting.storagePath;
+          if (path.isNotEmpty) {
+            try { await storage.ref(path).delete(); } catch (_) {}
+          }
+          await firestore.collection(item.collectionPath).doc(item.id).delete();
         }
       }
-      await batch.commit();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Cleared $count sighting${count != 1 ? 's' : ''} from $dayLabel.')),
+          SnackBar(content: Text('Cleared $count item${count != 1 ? 's' : ''} from $dayLabel.')),
         );
       }
     } catch (e) {
@@ -198,17 +225,25 @@ class _ActivityScreenState extends State<ActivityScreen> {
     }
   }
 
-  // ── Open detail dialog ─────────────────────────────────────────────────────
+  // ── Open detail ────────────────────────────────────────────────────────────
 
-  void _openDetail(_TaggedSighting tagged) {
+  void _openDetail(_ActivityItem item) {
     if (_isSelectionMode) return;
+    Widget detailScreen;
+    if (item is _InstanceItem) {
+      detailScreen = _InstanceDetailScreen(item: item);
+    } else if (item is _SnapshotItem) {
+      detailScreen = _SightingDetailScreen(item: item);
+    } else {
+      return;
+    }
     showGeneralDialog(
       context: context,
       barrierColor: Colors.black.withValues(alpha: 0.92),
       barrierDismissible: true,
       barrierLabel: 'Close',
       transitionDuration: const Duration(milliseconds: 280),
-      pageBuilder: (ctx, a1, a2) => _SightingDetailScreen(tagged: tagged),
+      pageBuilder: (ctx, a1, a2) => detailScreen,
       transitionBuilder: (ctx, a1, a2, child) => SlideTransition(
         position: Tween(begin: const Offset(0, 1), end: Offset.zero).animate(a1),
         child: child,
@@ -218,15 +253,15 @@ class _ActivityScreenState extends State<ActivityScreen> {
 
   // ── Group by date ──────────────────────────────────────────────────────────
 
-  List<_DayGroup> _groupByDay(List<_TaggedSighting> sightings) {
-    final Map<String, List<_TaggedSighting>> map = {};
-    for (final s in sightings) {
-      final t = s.sighting.timestamp;
+  List<_DayGroup> _groupByDay(List<_ActivityItem> items) {
+    final Map<String, List<_ActivityItem>> map = {};
+    for (final item in items) {
+      final t = item.timestamp;
       final key = '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}';
-      map.putIfAbsent(key, () => []).add(s);
+      map.putIfAbsent(key, () => []).add(item);
     }
     final groups = map.entries
-        .map((e) => _DayGroup(dateKey: e.key, sightings: e.value))
+        .map((e) => _DayGroup(dateKey: e.key, items: e.value))
         .toList()
       ..sort((a, b) => b.dateKey.compareTo(a.dateKey));
     return groups;
@@ -291,8 +326,7 @@ class _ActivityScreenState extends State<ActivityScreen> {
                 ? const Padding(
                     padding: EdgeInsets.all(14),
                     child: SizedBox(
-                      width: 20,
-                      height: 20,
+                      width: 20, height: 20,
                       child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
                     ),
                   )
@@ -309,7 +343,7 @@ class _ActivityScreenState extends State<ActivityScreen> {
           ],
         ],
       ),
-      body: StreamBuilder<List<_TaggedSighting>>(
+      body: StreamBuilder<List<_ActivityItem>>(
         stream: _unidentifiedStream,
         builder: (context, snapshot) {
           if (snapshot.hasError) {
@@ -346,7 +380,7 @@ class _ActivityScreenState extends State<ActivityScreen> {
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // ── Day header ────────────────────────────────────────────
+                  // ── Day header ──────────────────────────────────────────
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
                     child: Row(
@@ -363,11 +397,11 @@ class _ActivityScreenState extends State<ActivityScreen> {
                         Container(
                           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                           decoration: BoxDecoration(
-                            color: Theme.of(context).primaryColor.withValues(alpha:0.12),
+                            color: Theme.of(context).primaryColor.withValues(alpha: 0.12),
                             borderRadius: BorderRadius.circular(12),
                           ),
                           child: Text(
-                            '${group.sightings.length}',
+                            '${group.items.length}',
                             style: TextStyle(
                               fontSize: 12,
                               fontWeight: FontWeight.bold,
@@ -391,39 +425,38 @@ class _ActivityScreenState extends State<ActivityScreen> {
                     ),
                   ),
 
-                  // ── Photo grid ────────────────────────────────────────────
-                  GridView.builder(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 4,
-                      crossAxisSpacing: 6,
-                      mainAxisSpacing: 6,
-                      childAspectRatio: 1.0,
-                    ),
-                    itemCount: group.sightings.length,
-                    itemBuilder: (ctx, i) {
-                      final tagged = group.sightings[i];
-                      final isSelected = _selectedIds.contains(tagged.sighting.id);
-                      return _ActivityTile(
-                        tagged: tagged,
+                  // ── Items list ──────────────────────────────────────────
+                  ...group.items.map((item) {
+                    final isSelected = _selectedIds.contains(item.id);
+                    if (item is _InstanceItem) {
+                      return _InstanceTile(
+                        item: item,
                         isSelected: isSelected,
                         isSelectionMode: _isSelectionMode,
-                        onTap: () {
-                          if (_isSelectionMode) {
-                            _toggleSelection(tagged.sighting.id);
-                          } else {
-                            _openDetail(tagged);
-                          }
-                        },
+                        onTap: () => _isSelectionMode
+                            ? _toggleSelection(item.id)
+                            : _openDetail(item),
                         onLongPress: () {
                           if (!_isSelectionMode) _toggleSelectionMode(true);
-                          _toggleSelection(tagged.sighting.id);
+                          _toggleSelection(item.id);
                         },
                       );
-                    },
-                  ),
+                    } else if (item is _SnapshotItem) {
+                      return _SnapshotTile(
+                        item: item,
+                        isSelected: isSelected,
+                        isSelectionMode: _isSelectionMode,
+                        onTap: () => _isSelectionMode
+                            ? _toggleSelection(item.id)
+                            : _openDetail(item),
+                        onLongPress: () {
+                          if (!_isSelectionMode) _toggleSelectionMode(true);
+                          _toggleSelection(item.id);
+                        },
+                      );
+                    }
+                    return const SizedBox.shrink();
+                  }),
                   const SizedBox(height: 8),
                 ],
               );
@@ -432,7 +465,7 @@ class _ActivityScreenState extends State<ActivityScreen> {
         },
       ),
       floatingActionButton: _isSelectionMode && _selectedIds.isNotEmpty
-          ? StreamBuilder<List<_TaggedSighting>>(
+          ? StreamBuilder<List<_ActivityItem>>(
               stream: _unidentifiedStream,
               builder: (ctx, snap) => FloatingActionButton.extended(
                 onPressed: snap.hasData ? () => _deleteSelected(snap.data!) : null,
@@ -448,36 +481,52 @@ class _ActivityScreenState extends State<ActivityScreen> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Data helpers
+// Activity item types
 // ─────────────────────────────────────────────────────────────────────────────
 
-class _TaggedSighting {
+abstract class _ActivityItem {
+  String get id;
+  DateTime get timestamp;
+}
+
+class _InstanceItem implements _ActivityItem {
+  final MotionInstance instance;
+  @override String get id => instance.id;
+  @override DateTime get timestamp => instance.timestamp;
+  _InstanceItem(this.instance);
+}
+
+class _SnapshotItem implements _ActivityItem {
   final Sighting sighting;
-  final String type; // 'motion_capture' | 'snapshot'
   final String collectionPath;
-  _TaggedSighting(this.sighting, this.type, this.collectionPath);
-  bool get isSnapshot => type == 'snapshot';
+  final String tileLabel;
+  @override String get id => sighting.id;
+  @override DateTime get timestamp => sighting.timestamp;
+  _SnapshotItem(this.sighting, {
+    this.collectionPath = LogPaths.snapshots,
+    this.tileLabel = 'Manual Snapshot',
+  });
 }
 
 class _DayGroup {
   final String dateKey;
-  final List<_TaggedSighting> sightings;
-  _DayGroup({required this.dateKey, required this.sightings});
+  final List<_ActivityItem> items;
+  _DayGroup({required this.dateKey, required this.items});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Activity Tile
+// Motion Instance Tile
 // ─────────────────────────────────────────────────────────────────────────────
 
-class _ActivityTile extends StatelessWidget {
-  final _TaggedSighting tagged;
+class _InstanceTile extends StatelessWidget {
+  final _InstanceItem item;
   final bool isSelected;
   final bool isSelectionMode;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
 
-  const _ActivityTile({
-    required this.tagged,
+  const _InstanceTile({
+    required this.item,
     required this.isSelected,
     required this.isSelectionMode,
     required this.onTap,
@@ -487,78 +536,559 @@ class _ActivityTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return InkWell(
-      onTap: onTap,
-      onLongPress: onLongPress,
-      borderRadius: BorderRadius.circular(10),
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          // Thumbnail
-          ClipRRect(
-            borderRadius: BorderRadius.circular(10),
-            child: CachedNetworkImage(
-              imageUrl: tagged.sighting.imageUrl,
-              fit: BoxFit.cover,
-              placeholder: (_, __) => Container(
-                color: Colors.grey.shade200,
-                child: const Center(child: CircularProgressIndicator(strokeWidth: 2)),
+    final instance = item.instance;
+    final t = instance.timestamp;
+    final timeStr = '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+    final durationStr = '${instance.motionDuration.toStringAsFixed(1)}s';
+    final isVideo = instance.isVideo;
+    final countLabel = isVideo
+        ? 'Video'
+        : '${instance.fileCount} photo${instance.fileCount != 1 ? 's' : ''}';
+
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      elevation: isSelected ? 4 : 2,
+      color: isSelected ? theme.primaryColor.withValues(alpha: 0.08) : null,
+      child: InkWell(
+        onTap: onTap,
+        onLongPress: onLongPress,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Row(
+            children: [
+              // Thumbnail
+              Stack(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: instance.thumbnailUrl.isNotEmpty
+                        ? CachedNetworkImage(
+                            imageUrl: instance.thumbnailUrl,
+                            width: 72, height: 72,
+                            fit: BoxFit.cover,
+                            placeholder: (_, __) => Container(
+                              width: 72, height: 72,
+                              color: Colors.grey.shade200,
+                              child: const Center(child: CircularProgressIndicator(strokeWidth: 2)),
+                            ),
+                            errorWidget: (_, __, ___) => Container(
+                              width: 72, height: 72,
+                              color: Colors.grey.shade200,
+                              child: const Icon(Icons.image_not_supported, color: Colors.grey),
+                            ),
+                          )
+                        : Container(
+                            width: 72, height: 72,
+                            color: Colors.grey.shade200,
+                            child: const Icon(Icons.image, color: Colors.grey),
+                          ),
+                  ),
+                  if (isVideo)
+                    Positioned(
+                      bottom: 2, right: 2,
+                      child: Container(
+                        padding: const EdgeInsets.all(2),
+                        decoration: BoxDecoration(
+                          color: Colors.blue.shade700.withValues(alpha: 0.85),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: const Icon(Icons.videocam, color: Colors.white, size: 14),
+                      ),
+                    ),
+                ],
               ),
-              errorWidget: (_, __, ___) => Container(
-                color: Colors.grey.shade200,
-                child: const Icon(Icons.image_not_supported, color: Colors.grey),
+              const SizedBox(width: 14),
+
+              // Metadata
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      timeStr,
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                    ),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        Icon(Icons.timer_outlined, size: 14, color: Colors.grey.shade600),
+                        const SizedBox(width: 4),
+                        Text(
+                          'Motion: $durationStr',
+                          style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: isVideo
+                            ? Colors.blue.shade50
+                            : theme.primaryColor.withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(
+                        countLabel,
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: isVideo ? Colors.blue.shade700 : theme.primaryColor,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              // Selection or chevron
+              if (isSelectionMode)
+                Container(
+                  width: 24, height: 24,
+                  decoration: BoxDecoration(
+                    color: isSelected ? theme.primaryColor : Colors.black26,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white, width: 1.5),
+                  ),
+                  child: Icon(
+                    isSelected ? Icons.check : null,
+                    color: Colors.white, size: 14,
+                  ),
+                )
+              else
+                const Icon(Icons.chevron_right, color: Colors.grey),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Snapshot Tile
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _SnapshotTile extends StatelessWidget {
+  final _SnapshotItem item;
+  final bool isSelected;
+  final bool isSelectionMode;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  const _SnapshotTile({
+    required this.item,
+    required this.isSelected,
+    required this.isSelectionMode,
+    required this.onTap,
+    required this.onLongPress,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final sighting = item.sighting;
+    final t = sighting.timestamp;
+    final timeStr = '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      elevation: isSelected ? 4 : 2,
+      color: isSelected ? theme.primaryColor.withValues(alpha: 0.08) : null,
+      child: InkWell(
+        onTap: onTap,
+        onLongPress: onLongPress,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Row(
+            children: [
+              // Thumbnail
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: CachedNetworkImage(
+                  imageUrl: sighting.imageUrl,
+                  width: 72, height: 72,
+                  fit: BoxFit.cover,
+                  placeholder: (_, __) => Container(
+                    width: 72, height: 72,
+                    color: Colors.grey.shade200,
+                    child: const Center(child: CircularProgressIndicator(strokeWidth: 2)),
+                  ),
+                  errorWidget: (_, __, ___) => Container(
+                    width: 72, height: 72,
+                    color: Colors.grey.shade200,
+                    child: const Icon(Icons.image_not_supported, color: Colors.grey),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 14),
+
+              // Metadata
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      timeStr,
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                    ),
+                    const SizedBox(height: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: Colors.amber.shade50,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(
+                        item.tileLabel,
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.amber.shade800,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              // Selection or chevron
+              if (isSelectionMode)
+                Container(
+                  width: 24, height: 24,
+                  decoration: BoxDecoration(
+                    color: isSelected ? theme.primaryColor : Colors.black26,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white, width: 1.5),
+                  ),
+                  child: Icon(
+                    isSelected ? Icons.check : null,
+                    color: Colors.white, size: 14,
+                  ),
+                )
+              else
+                const Icon(Icons.chevron_right, color: Colors.grey),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Instance Detail Screen
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _InstanceDetailScreen extends StatefulWidget {
+  final _InstanceItem item;
+  const _InstanceDetailScreen({required this.item});
+
+  @override
+  State<_InstanceDetailScreen> createState() => _InstanceDetailScreenState();
+}
+
+class _InstanceDetailScreenState extends State<_InstanceDetailScreen> {
+  bool _isLoading = false;
+  int _currentPhotoIndex = 0;
+  final _transformController = TransformationController();
+
+  MotionInstance get _instance => widget.item.instance;
+
+  @override
+  void dispose() {
+    _transformController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _delete() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete this sighting?'),
+        content: Text(
+          'This will permanently remove ${_instance.fileCount} '
+          '${_instance.isVideo ? 'video' : 'photo${_instance.fileCount != 1 ? 's' : ''}'} '
+          'and the log entry.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Delete', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    setState(() => _isLoading = true);
+    try {
+      final storage = FirebaseStorage.instance;
+      for (final path in _instance.storagePaths) {
+        if (path.isNotEmpty) {
+          try { await storage.ref(path).delete(); } catch (_) {}
+        }
+      }
+      await FirebaseFirestore.instance
+          .collection(LogPaths.motionCaptures)
+          .doc(_instance.id)
+          .delete();
+      if (mounted) Navigator.pop(context);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Delete failed: $e')));
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  void _openSpeciesPicker() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => _SpeciesPickerSheet(
+        itemId: _instance.id,
+        imageUrl: _instance.thumbnailUrl,
+        collectionPath: LogPaths.motionCaptures,
+        useSnakeCase: true, // Pi writes snake_case for instances
+        onIdentified: () {
+          if (mounted) Navigator.pop(context);
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final t = _instance.timestamp;
+    final timeStr =
+        '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}  '
+        '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Column(
+          children: [
+            // Header bar
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Identify This Sighting',
+                      style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  if (!_instance.isVideo)
+                    IconButton(
+                      icon: const Icon(Icons.zoom_out_map, color: Colors.white),
+                      onPressed: () => _transformController.value = Matrix4.identity(),
+                      tooltip: 'Reset zoom',
+                    ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white),
+                    onPressed: () => Navigator.pop(context),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(color: Colors.white24, height: 1),
+
+            // Body: viewer left, panel right
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Left: photo viewer or video placeholder
+                    Expanded(
+                      flex: 2,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade900,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: theme.primaryColor.withValues(alpha: 0.6), width: 3),
+                        ),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(10),
+                          child: _instance.isVideo
+                              ? _buildVideoPlaceholder(theme)
+                              : _buildPhotoViewer(theme),
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(width: 14),
+
+                    // Right panel
+                    Expanded(
+                      flex: 1,
+                      child: Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade900,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: SingleChildScrollView(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              // Source badge
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: theme.primaryColor.withValues(alpha: 0.15),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Text(
+                                  'Motion Capture',
+                                  style: TextStyle(
+                                    color: theme.primaryColor,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                              ),
+
+                              const SizedBox(height: 14),
+                              _metaRow('Captured', timeStr),
+                              _metaRow('Duration', '${_instance.motionDuration.toStringAsFixed(1)}s'),
+                              _metaRow('Mode', _instance.captureMode == 'video' ? 'Video' : 'Photo burst'),
+                              _metaRow(
+                                _instance.isVideo ? 'Recording' : 'Photos',
+                                _instance.isVideo ? '1 video' : '${_instance.fileCount}',
+                              ),
+                              if (_instance.resolution.isNotEmpty)
+                                _metaRow('Resolution', _instance.resolution),
+
+                              const Divider(color: Colors.white24, height: 28),
+
+                              ElevatedButton.icon(
+                                onPressed: _isLoading ? null : _openSpeciesPicker,
+                                icon: const Icon(Icons.search),
+                                label: const Text('Identify as...', style: TextStyle(fontSize: 16)),
+                                style: ElevatedButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(vertical: 14),
+                                  backgroundColor: theme.primaryColor,
+                                  foregroundColor: Colors.white,
+                                ),
+                              ),
+
+                              const SizedBox(height: 28),
+
+                              OutlinedButton.icon(
+                                onPressed: _isLoading ? null : _delete,
+                                icon: const Icon(Icons.delete_forever),
+                                label: const Text('No bird? Delete'),
+                                style: OutlinedButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                  foregroundColor: Colors.red.shade400,
+                                  side: BorderSide(color: Colors.red.shade400),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPhotoViewer(ThemeData theme) {
+    if (_instance.imageUrls.isEmpty) {
+      return const Center(
+        child: Icon(Icons.image_not_supported, size: 80, color: Colors.grey),
+      );
+    }
+    return Column(
+      children: [
+        Expanded(
+          child: PageView.builder(
+            itemCount: _instance.imageUrls.length,
+            onPageChanged: (i) => setState(() {
+              _currentPhotoIndex = i;
+              _transformController.value = Matrix4.identity();
+            }),
+            itemBuilder: (ctx, i) => InteractiveViewer(
+              transformationController: i == _currentPhotoIndex ? _transformController : null,
+              boundaryMargin: EdgeInsets.zero,
+              minScale: 1.0,
+              maxScale: 5.0,
+              child: CachedNetworkImage(
+                imageUrl: _instance.imageUrls[i],
+                fit: BoxFit.contain,
+                placeholder: (_, __) => Center(
+                  child: CircularProgressIndicator(color: theme.primaryColor),
+                ),
+                errorWidget: (_, __, ___) =>
+                    const Icon(Icons.image_not_supported, size: 80, color: Colors.grey),
               ),
             ),
           ),
-
-          // Snapshot badge (top-left)
-          if (tagged.isSnapshot)
-            Positioned(
-              top: 4,
-              left: 4,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
-                decoration: BoxDecoration(
-                  color: Colors.amber.shade700.withValues(alpha:0.9),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: const Text(
-                  'Snap',
-                  style: TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
-                ),
-              ),
+        ),
+        if (_instance.fileCount > 1)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text(
+              'Photo ${_currentPhotoIndex + 1} of ${_instance.fileCount}',
+              style: const TextStyle(color: Colors.white60, fontSize: 13),
             ),
+          ),
+      ],
+    );
+  }
 
-          // Selection overlay
-          if (isSelectionMode)
-            Container(
-              decoration: BoxDecoration(
-                color: isSelected ? theme.primaryColor.withValues(alpha:0.25) : Colors.transparent,
-                borderRadius: BorderRadius.circular(10),
-                border: isSelected ? Border.all(color: theme.primaryColor, width: 2.5) : null,
-              ),
-            ),
+  Widget _buildVideoPlaceholder(ThemeData theme) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.videocam, size: 72, color: Colors.blue.shade300),
+          const SizedBox(height: 12),
+          const Text(
+            'Video recording',
+            style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'In-app video playback coming soon.',
+            style: TextStyle(color: Colors.white54, fontSize: 13),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
 
-          // Selection check
-          if (isSelectionMode)
-            Positioned(
-              top: 4,
-              right: 4,
-              child: Container(
-                width: 22,
-                height: 22,
-                decoration: BoxDecoration(
-                  color: isSelected ? theme.primaryColor : Colors.black45,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 1.5),
-                ),
-                child: Icon(
-                  isSelected ? Icons.check : null,
-                  color: Colors.white,
-                  size: 14,
-                ),
-              ),
-            ),
+  Widget _metaRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 90,
+            child: Text(label, style: const TextStyle(color: Colors.white60, fontWeight: FontWeight.w500)),
+          ),
+          Expanded(child: Text(value, style: const TextStyle(color: Colors.white))),
         ],
       ),
     );
@@ -566,12 +1096,12 @@ class _ActivityTile extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sighting Detail Screen
+// Snapshot Detail Screen
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _SightingDetailScreen extends StatefulWidget {
-  final _TaggedSighting tagged;
-  const _SightingDetailScreen({required this.tagged});
+  final _SnapshotItem item;
+  const _SightingDetailScreen({required this.item});
 
   @override
   State<_SightingDetailScreen> createState() => _SightingDetailScreenState();
@@ -581,7 +1111,7 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
   bool _isLoading = false;
   final _transformController = TransformationController();
 
-  Sighting get _sighting => widget.tagged.sighting;
+  Sighting get _sighting => widget.item.sighting;
 
   double _parseAspectRatio(String res) {
     final parts = res.split('x');
@@ -598,8 +1128,6 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
     _transformController.dispose();
     super.dispose();
   }
-
-  // ── Delete ─────────────────────────────────────────────────────────────────
 
   Future<void> _delete() async {
     final confirm = await showDialog<bool>(
@@ -622,7 +1150,7 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
     setState(() => _isLoading = true);
     try {
       await FirebaseFirestore.instance
-          .collection(widget.tagged.collectionPath)
+          .collection(widget.item.collectionPath)
           .doc(_sighting.id)
           .delete();
       if (_sighting.storagePath.isNotEmpty) {
@@ -637,17 +1165,16 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
     }
   }
 
-  // ── Open species picker ────────────────────────────────────────────────────
-
   void _openSpeciesPicker() {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       builder: (ctx) => _SpeciesPickerSheet(
-        sightingId: _sighting.id,
-        sightingImageUrl: _sighting.imageUrl,
-        collectionPath: widget.tagged.collectionPath,
+        itemId: _sighting.id,
+        imageUrl: _sighting.imageUrl,
+        collectionPath: widget.item.collectionPath,
+        useSnakeCase: false, // snapshots and legacy captures both use camelCase
         onIdentified: () {
           if (mounted) Navigator.pop(context);
         },
@@ -663,26 +1190,20 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
     final timeStr =
         '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}  '
         '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
-    final typeLabel = widget.tagged.isSnapshot ? 'Manual Snapshot' : 'Motion Capture';
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea(
         child: Column(
           children: [
-            // Header bar
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
               child: Row(
                 children: [
                   Expanded(
-                    child: Text(
+                    child: const Text(
                       'Identify This Sighting',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
-                      ),
+                      style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
                     ),
                   ),
                   IconButton(
@@ -699,7 +1220,6 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
             ),
             const Divider(color: Colors.white24, height: 1),
 
-            // Body: image left, panel right
             Expanded(
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -715,7 +1235,7 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
                           decoration: BoxDecoration(
                             color: Colors.grey.shade900,
                             borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: theme.primaryColor.withValues(alpha:0.6), width: 3),
+                            border: Border.all(color: theme.primaryColor.withValues(alpha: 0.6), width: 3),
                           ),
                           child: ClipRRect(
                             borderRadius: BorderRadius.circular(10),
@@ -727,9 +1247,8 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
                               child: CachedNetworkImage(
                                 imageUrl: _sighting.imageUrl,
                                 fit: BoxFit.contain,
-                                placeholder: (_, __) => Center(
-                                  child: CircularProgressIndicator(color: theme.primaryColor),
-                                ),
+                                placeholder: (_, __) =>
+                                    Center(child: CircularProgressIndicator(color: theme.primaryColor)),
                                 errorWidget: (_, __, ___) =>
                                     const Icon(Icons.image_not_supported, size: 80, color: Colors.grey),
                               ),
@@ -754,34 +1273,25 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
-                              // Source badge
                               Container(
                                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                                 decoration: BoxDecoration(
-                                  color: widget.tagged.isSnapshot
-                                      ? Colors.amber.shade700.withValues(alpha:0.2)
-                                      : theme.primaryColor.withValues(alpha:0.15),
+                                  color: Colors.amber.shade700.withValues(alpha: 0.2),
                                   borderRadius: BorderRadius.circular(8),
                                 ),
                                 child: Text(
-                                  typeLabel,
+                                  widget.item.tileLabel,
                                   style: TextStyle(
-                                    color: widget.tagged.isSnapshot
-                                        ? Colors.amber.shade400
-                                        : theme.primaryColor,
+                                    color: Colors.amber.shade400,
                                     fontWeight: FontWeight.bold,
                                     fontSize: 13,
                                   ),
                                 ),
                               ),
-
                               const SizedBox(height: 14),
                               _metaRow('Captured', timeStr),
                               _metaRow('Resolution', _sighting.resolution),
-
                               const Divider(color: Colors.white24, height: 28),
-
-                              // Identify button
                               ElevatedButton.icon(
                                 onPressed: _isLoading ? null : _openSpeciesPicker,
                                 icon: const Icon(Icons.search),
@@ -792,10 +1302,7 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
                                   foregroundColor: Colors.white,
                                 ),
                               ),
-
                               const SizedBox(height: 28),
-
-                              // Delete button
                               OutlinedButton.icon(
                                 onPressed: _isLoading ? null : _delete,
                                 icon: const Icon(Icons.delete_forever),
@@ -831,9 +1338,7 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
             width: 90,
             child: Text(label, style: const TextStyle(color: Colors.white60, fontWeight: FontWeight.w500)),
           ),
-          Expanded(
-            child: Text(value, style: const TextStyle(color: Colors.white)),
-          ),
+          Expanded(child: Text(value, style: const TextStyle(color: Colors.white))),
         ],
       ),
     );
@@ -845,15 +1350,17 @@ class _SightingDetailScreenState extends State<_SightingDetailScreen> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _SpeciesPickerSheet extends StatefulWidget {
-  final String sightingId;
-  final String sightingImageUrl;
+  final String itemId;
+  final String imageUrl;
   final String collectionPath;
+  final bool useSnakeCase; // true for motion instances, false for snapshots
   final VoidCallback onIdentified;
 
   const _SpeciesPickerSheet({
-    required this.sightingId,
-    required this.sightingImageUrl,
+    required this.itemId,
+    required this.imageUrl,
     required this.collectionPath,
+    required this.useSnakeCase,
     required this.onIdentified,
   });
 
@@ -880,7 +1387,7 @@ class _SpeciesPickerSheetState extends State<_SpeciesPickerSheet> {
     try {
       final firestore = FirebaseFirestore.instance;
       final catalogRef = firestore.collection(Bird.collectionPath).doc(catalogBirdId);
-      final sightingRef = firestore.collection(widget.collectionPath).doc(widget.sightingId);
+      final itemRef = firestore.collection(widget.collectionPath).doc(widget.itemId);
 
       await firestore.runTransaction((txn) async {
         final catalogSnap = await txn.get(catalogRef);
@@ -893,15 +1400,24 @@ class _SpeciesPickerSheetState extends State<_SpeciesPickerSheet> {
         } else {
           txn.set(catalogRef, Bird.createNewCatalogEntry(
             speciesName: speciesName,
-            imageStoragePath: widget.sightingImageUrl,
+            imageStoragePath: widget.imageUrl,
           ));
         }
 
-        txn.update(sightingRef, {
-          'isIdentified': true,
-          'catalogBirdId': catalogBirdId,
-          'speciesName': speciesName,
-        });
+        // Update sighting/instance with the correct field names
+        if (widget.useSnakeCase) {
+          txn.update(itemRef, {
+            'is_identified': true,
+            'catalog_bird_id': catalogBirdId,
+            'species_name': speciesName,
+          });
+        } else {
+          txn.update(itemRef, {
+            'isIdentified': true,
+            'catalogBirdId': catalogBirdId,
+            'speciesName': speciesName,
+          });
+        }
       });
 
       if (mounted) {
@@ -946,32 +1462,24 @@ class _SpeciesPickerSheetState extends State<_SpeciesPickerSheet> {
         ),
         child: Column(
           children: [
-            // Handle
             Container(
               margin: const EdgeInsets.symmetric(vertical: 10),
-              width: 40,
-              height: 4,
+              width: 40, height: 4,
               decoration: BoxDecoration(
                 color: Colors.white30,
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
 
-            // Title
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
               child: Text(
                 'Identify this sighting',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                ),
+                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
               ),
             ),
             const SizedBox(height: 12),
 
-            // Search field
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
               child: TextField(
@@ -1002,7 +1510,6 @@ class _SpeciesPickerSheetState extends State<_SpeciesPickerSheet> {
             ),
             const SizedBox(height: 8),
 
-            // Species list
             Expanded(
               child: StreamBuilder<QuerySnapshot>(
                 stream: FirebaseFirestore.instance
@@ -1026,12 +1533,9 @@ class _SpeciesPickerSheetState extends State<_SpeciesPickerSheet> {
                   return ListView.builder(
                     controller: scrollController,
                     padding: const EdgeInsets.symmetric(horizontal: 12),
-                    itemCount: birds.length + 1, // +1 for "New species" footer
+                    itemCount: birds.length + 1,
                     itemBuilder: (ctx, i) {
-                      if (i == birds.length) {
-                        // Footer: create new
-                        return _buildNewSpeciesFooter(theme);
-                      }
+                      if (i == birds.length) return _buildNewSpeciesFooter(theme);
                       final bird = birds[i];
                       return ListTile(
                         leading: ClipRRect(
@@ -1039,9 +1543,7 @@ class _SpeciesPickerSheetState extends State<_SpeciesPickerSheet> {
                           child: bird.primaryImageUrl.isNotEmpty
                               ? CachedNetworkImage(
                                   imageUrl: bird.primaryImageUrl,
-                                  width: 48,
-                                  height: 48,
-                                  fit: BoxFit.cover,
+                                  width: 48, height: 48, fit: BoxFit.cover,
                                   errorWidget: (_, __, ___) =>
                                       const Icon(Icons.pets, color: Colors.grey, size: 36),
                                 )
@@ -1107,7 +1609,8 @@ class _SpeciesPickerSheetState extends State<_SpeciesPickerSheet> {
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                   ),
                   child: _isLoading
-                      ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                      ? const SizedBox(width: 18, height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
                       : const Text('Create'),
                 ),
                 IconButton(
